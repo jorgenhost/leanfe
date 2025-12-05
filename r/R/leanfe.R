@@ -71,11 +71,11 @@
 #'
 #' # Basic usage with formula
 #' df <- pl$read_parquet("data.parquet")
-#' result <- fast_feols(df, formula = "y ~ treatment | customer + product")
+#' result <- leanfe(df, formula = "y ~ treatment | customer + product")
 #' print(result$coefficients["treatment"])
 #'
 #' # With clustered standard errors
-#' result <- fast_feols(
+#' result <- leanfe(
 #'   df,
 #'   formula = "y ~ treatment | customer + product",
 #'   vcov = "cluster",
@@ -83,14 +83,14 @@
 #' )
 #'
 #' # Using DuckDB for large datasets
-#' result <- fast_feols(
+#' result <- leanfe(
 #'   "large_data.parquet",
 #'   formula = "y ~ treatment | fe1 + fe2",
 #'   backend = "duckdb"
 #' )
 #'
 #' # Difference-in-Differences
-#' result <- fast_feols(
+#' result <- leanfe(
 #'   df,
 #'   formula = "y ~ treated_post | state + year",
 #'   vcov = "cluster",
@@ -99,7 +99,7 @@
 #' }
 #'
 #' @export
-fast_feols <- function(
+leanfe <- function(
   data,
   y_col = NULL,
   x_cols = NULL,
@@ -119,7 +119,7 @@ fast_feols <- function(
   }
   
   if (backend == "polars") {
-    fast_feols_polars(
+    leanfe_polars(
       data = data,
       y_col = y_col,
       x_cols = x_cols,
@@ -134,7 +134,7 @@ fast_feols <- function(
       sample_frac = sample_frac
     )
   } else {
-    fast_feols_duckdb(
+    leanfe_duckdb(
       data = data,
       y_col = y_col,
       x_cols = x_cols,

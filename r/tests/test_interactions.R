@@ -20,7 +20,7 @@ df <- pl$DataFrame(
   fe2 = (0:1199) %% 50
 )
 
-result <- fast_feols_polars(df, formula = "y ~ treatment:i(region) | fe1 + fe2", vcov = "HC1")
+result <- leanfe_polars(df, formula = "y ~ treatment:i(region) | fe1 + fe2", vcov = "HC1")
 
 # Verify interaction terms created (first category A is reference, dropped)
 stopifnot("treatment_B" %in% names(result$coefficients))
@@ -33,7 +33,7 @@ cat("PASSED\n")
 
 # Test 2: Interaction with robust standard errors
 cat("Test 2: Interaction with robust SE... ")
-result <- fast_feols_polars(df, formula = "y ~ treatment:i(region) | fe1 + fe2", vcov = "HC1")
+result <- leanfe_polars(df, formula = "y ~ treatment:i(region) | fe1 + fe2", vcov = "HC1")
 
 stopifnot(result$vcov_type == "HC1")
 stopifnot("treatment_B" %in% names(result$std_errors))
@@ -63,7 +63,7 @@ df <- df$with_columns(
     pl$lit(rnorm(n, 0, 1))
 )
 
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df, 
   formula = "y ~ treatment:i(region) | fe1 + fe2",
   vcov = "cluster", 

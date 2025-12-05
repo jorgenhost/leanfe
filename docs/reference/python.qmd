@@ -198,7 +198,7 @@ print("WLS result:", result_wls['coefficients'])
 ```
 leanfe/
 ├── __init__.py          # Exports leanfe
-├── fast_feols.py        # Main entry point
+├── leanfe.py        # Main entry point
 ├── polars_impl.py       # Polars backend implementation
 ├── duckdb_impl.py       # DuckDB backend implementation
 └── common.py            # Shared utilities

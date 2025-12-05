@@ -2,7 +2,7 @@
 
 import polars as pl
 import numpy as np
-from leanfe import fast_feols_polars
+from leanfe import leanfe_polars
 
 
 def test_weighted_regression():
@@ -22,7 +22,7 @@ def test_weighted_regression():
         "weights": weights
     })
     
-    result = fast_feols_polars(df, "y", ["x"], ["fe1"], weights="weights")
+    result = leanfe_polars(df, "y", ["x"], ["fe1"], weights="weights")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
@@ -41,7 +41,7 @@ def test_weighted_with_formula():
         "weights": np.random.uniform(0.5, 2.0, n)
     })
     
-    result = fast_feols_polars(df, formula="y ~ x | fe1", weights="weights")
+    result = leanfe_polars(df, formula="y ~ x | fe1", weights="weights")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
@@ -59,7 +59,7 @@ def test_weighted_with_robust_se():
         "weights": np.random.uniform(0.5, 2.0, n)
     })
     
-    result = fast_feols_polars(df, "y", ["x"], ["fe1"], 
+    result = leanfe_polars(df, "y", ["x"], ["fe1"], 
                                weights="weights", vcov="HC1")
     
     assert result["vcov_type"] == "HC1"

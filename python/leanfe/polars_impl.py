@@ -126,7 +126,7 @@ def _optimize_dtypes(df: pl.DataFrame, fe_cols: List[str]) -> pl.DataFrame:
     return df
 
 
-def fast_feols_polars(
+def leanfe_polars(
     data: Union[str, pl.DataFrame],
     y_col: Optional[str] = None,
     x_cols: Optional[List[str]] = None,
@@ -217,15 +217,15 @@ def fast_feols_polars(
         x_cols = x_cols + interaction_cols
     
     # Check for continuous treatment variables
-    continuous_treatments = []
+    continuous_regressors = []
     for col in x_cols:
         if df[col].dtype in (pl.Float64, pl.Float32):
             n_unique = df[col].n_unique()
             if n_unique > 10:
-                continuous_treatments.append(col)
-    if continuous_treatments:
+                continuous_regressors.append(col)
+    if continuous_regressors:
         warnings.warn(
-            f"Continuous treatment variable(s) detected: {continuous_treatments}.",
+            f"Continuous regressor(s) detected: {continuous_regressors}.",
             UserWarning, stacklevel=2
         )
     

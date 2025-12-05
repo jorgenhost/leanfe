@@ -115,7 +115,7 @@ NULL
 
 #' Fast Fixed Effects OLS using Polars Backend
 #'
-#' Polars-based implementation optimized for speed. Use \code{\link{fast_feols}} 
+#' Polars-based implementation optimized for speed. Use \code{\link{leanfe}} 
 #' for the recommended unified API.
 #'
 #' @param data Polars DataFrame, R data.frame, or path to parquet file.
@@ -149,9 +149,9 @@ NULL
 #'   \item{n_clusters}{Number of clusters (if clustered SEs)}
 #' }
 #'
-#' @seealso \code{\link{fast_feols}}, \code{\link{fast_feols_duckdb}}
+#' @seealso \code{\link{leanfe}}, \code{\link{leanfe_duckdb}}
 #' @export
-fast_feols_polars <- function(
+leanfe_polars <- function(
   data,
   y_col = NULL,
   x_cols = NULL,
@@ -224,20 +224,20 @@ fast_feols_polars <- function(
   }
   
   # Check for continuous treatment variables
-  continuous_treatments <- c()
+  continuous_regressors <- c()
   for (col in x_cols) {
     dtype <- df$schema[[col]]
     if (identical(dtype, pl$Float64) || identical(dtype, pl$Float32)) {
       n_unique <- as.data.frame(df$select(pl$col(col)$n_unique()))[[1]]
       if (n_unique > 10) {
-        continuous_treatments <- c(continuous_treatments, col)
+        continuous_regressors <- c(continuous_regressors, col)
       }
     }
   }
-  if (length(continuous_treatments) > 0) {
+  if (length(continuous_regressors) > 0) {
     warning(sprintf(
-      "Continuous treatment variable(s) detected: %s.",
-      paste(continuous_treatments, collapse = ", ")
+      "Continuous regressor(s) detected: %s.",
+      paste(continuous_regressors, collapse = ", ")
     ), call. = FALSE)
   }
   

@@ -189,7 +189,7 @@ print(result_wls$coefficients)
 ```
 leanfe/
 ├── R/
-│   ├── fast_feols.R    # Main entry point
+│   ├── leanfe.R    # Main entry point
 │   ├── polars.R        # Polars backend
 │   ├── duckdb.R        # DuckDB backend
 │   └── common.R        # Shared utilities

@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import warnings
 
-from leanfe.polars_impl import fast_feols_polars
-from leanfe.duckdb_impl import fast_feols_duckdb
+from leanfe.polars_impl import leanfe_polars
+from leanfe.duckdb_impl import leanfe_duckdb
 
 
 @pytest.fixture
@@ -36,8 +36,8 @@ def continuous_treatment_data():
 
 def test_continuous_treatment_warning_polars(continuous_treatment_data):
     """Test that continuous treatment triggers warning in Polars."""
-    with pytest.warns(UserWarning, match="Continuous treatment variable"):
-        result = fast_feols_polars(
+    with pytest.warns(UserWarning, match="Continuous regressor"):
+        result = leanfe_polars(
             continuous_treatment_data,
             formula="revenue ~ treatment_continuous | customer_id + product_id"
         )
@@ -49,8 +49,8 @@ def test_continuous_treatment_warning_polars(continuous_treatment_data):
 
 def test_continuous_treatment_warning_duckdb(continuous_treatment_data):
     """Test that continuous treatment triggers warning in DuckDB."""
-    with pytest.warns(UserWarning, match="Continuous treatment variable"):
-        result = fast_feols_duckdb(
+    with pytest.warns(UserWarning, match="Continuous regressor"):
+        result = leanfe_duckdb(
             continuous_treatment_data,
             formula="revenue ~ treatment_continuous | customer_id + product_id"
         )
@@ -64,7 +64,7 @@ def test_binary_treatment_no_warning_polars(continuous_treatment_data):
     """Test that binary treatment does NOT trigger warning."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # Turn warnings into errors
-        result = fast_feols_polars(
+        result = leanfe_polars(
             continuous_treatment_data,
             formula="revenue ~ treatment_binary | customer_id + product_id"
         )
@@ -75,8 +75,8 @@ def test_binary_treatment_no_warning_polars(continuous_treatment_data):
 
 def test_mixed_treatments_warning_polars(continuous_treatment_data):
     """Test that mixed treatments (binary + continuous) triggers warning."""
-    with pytest.warns(UserWarning, match="Continuous treatment variable"):
-        result = fast_feols_polars(
+    with pytest.warns(UserWarning, match="Continuous regressor"):
+        result = leanfe_polars(
             continuous_treatment_data,
             formula="revenue ~ treatment_binary + treatment_continuous | customer_id + product_id"
         )
@@ -108,7 +108,7 @@ def test_categorical_treatment_no_warning():
     
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # Turn warnings into errors
-        result = fast_feols_polars(
+        result = leanfe_polars(
             df,
             formula="revenue ~ treatment_categorical | customer_id + product_id"
         )

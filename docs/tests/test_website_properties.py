@@ -410,15 +410,15 @@ class TestAPIDocumentation:
         # Look for code blocks
         code_blocks = python_api_content.find_all("code")
         
-        # Check for Python code with fast_feols
+        # Check for Python code with leanfe
         has_example = False
         for block in code_blocks:
             text = block.get_text()
-            if "fast_feols" in text and ("formula" in text or "data" in text):
+            if "leanfe" in text and ("formula" in text or "data" in text):
                 has_example = True
                 break
         
-        assert has_example, "API reference should have executable examples using fast_feols"
+        assert has_example, "API reference should have executable examples using leanfe"
     
     def test_api_documents_return_value(self, python_api_content):
         """

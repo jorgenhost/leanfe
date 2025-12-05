@@ -7,11 +7,11 @@ Main entry point for the package with support for Polars and DuckDB backends.
 from typing import List, Optional, Union, Literal
 import polars as pl
 
-from .polars_impl import fast_feols_polars
-from .duckdb_impl import fast_feols_duckdb
+from .polars_impl import leanfe_polars
+from .duckdb_impl import leanfe_duckdb
 
 
-def fast_feols(
+def leanfe(
     data: Union[str, pl.DataFrame],
     y_col: Optional[str] = None,
     x_cols: Optional[List[str]] = None,
@@ -103,13 +103,13 @@ def fast_feols(
     --------
     Basic usage with formula:
     
-    >>> from fast_hdfe_reg import fast_feols
-    >>> result = fast_feols(df, formula="y ~ treatment | customer + product")
+    >>> from leanfe import leanfe
+    >>> result = leanfe(df, formula="y ~ treatment | customer + product")
     >>> print(result['coefficients']['treatment'])
     
     With clustered standard errors:
     
-    >>> result = fast_feols(
+    >>> result = leanfe(
     ...     df,
     ...     formula="y ~ treatment | customer + product",
     ...     vcov="cluster",
@@ -118,7 +118,7 @@ def fast_feols(
     
     Using DuckDB for large datasets:
     
-    >>> result = fast_feols(
+    >>> result = leanfe(
     ...     "large_data.parquet",
     ...     formula="y ~ treatment | fe1 + fe2",
     ...     backend="duckdb"
@@ -126,7 +126,7 @@ def fast_feols(
     
     Difference-in-Differences:
     
-    >>> result = fast_feols(
+    >>> result = leanfe(
     ...     df,
     ...     formula="y ~ treated_post | state + year",
     ...     vcov="cluster",
@@ -134,7 +134,7 @@ def fast_feols(
     ... )
     """
     if backend == "polars":
-        return fast_feols_polars(
+        return leanfe_polars(
             data=data,
             y_col=y_col,
             x_cols=x_cols,
@@ -149,7 +149,7 @@ def fast_feols(
             sample_frac=sample_frac
         )
     elif backend == "duckdb":
-        return fast_feols_duckdb(
+        return leanfe_duckdb(
             data=data,
             y_col=y_col,
             x_cols=x_cols,
@@ -167,5 +167,7 @@ def fast_feols(
         raise ValueError(f"backend must be 'polars' or 'duckdb', got '{backend}'")
 
 
-# Alias for cleaner API: leanfe.leanfe() or from leanfe import leanfe
-leanfe = fast_feols
+# Backwards compatibility aliases
+fast_feols = leanfe
+fast_feols_polars = leanfe_polars
+fast_feols_duckdb = leanfe_duckdb

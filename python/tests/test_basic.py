@@ -2,7 +2,7 @@
 
 import polars as pl
 import numpy as np
-from leanfe import fast_feols, fast_feols_polars, fast_feols_duckdb
+from leanfe import leanfe, leanfe_polars, leanfe_duckdb
 
 
 def test_polars_basic():
@@ -17,7 +17,7 @@ def test_polars_basic():
         "fe2": np.random.randint(0, 5, n),
     })
     
-    result = fast_feols_polars(df, "y", ["x"], ["fe1", "fe2"])
+    result = leanfe_polars(df, "y", ["x"], ["fe1", "fe2"])
     
     assert "coefficients" in result
     assert "std_errors" in result
@@ -36,7 +36,7 @@ def test_formula_api():
         "fe2": np.random.randint(0, 5, n),
     })
     
-    result = fast_feols_polars(df, formula="y ~ x | fe1 + fe2")
+    result = leanfe_polars(df, formula="y ~ x | fe1 + fe2")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
@@ -54,15 +54,15 @@ def test_standard_errors():
     })
     
     # IID
-    result_iid = fast_feols_polars(df, "y", ["x"], ["fe1"], vcov="iid")
+    result_iid = leanfe_polars(df, "y", ["x"], ["fe1"], vcov="iid")
     assert result_iid["vcov_type"] == "iid"
     
     # HC1
-    result_hc1 = fast_feols_polars(df, "y", ["x"], ["fe1"], vcov="HC1")
+    result_hc1 = leanfe_polars(df, "y", ["x"], ["fe1"], vcov="HC1")
     assert result_hc1["vcov_type"] == "HC1"
     
     # Clustered
-    result_cluster = fast_feols_polars(
+    result_cluster = leanfe_polars(
         df, "y", ["x"], ["fe1"], 
         vcov="cluster", cluster_cols=["cluster"]
     )
@@ -71,7 +71,7 @@ def test_standard_errors():
 
 
 def test_unified_api_polars():
-    """Test unified fast_feols() with Polars backend."""
+    """Test unified leanfe() with Polars backend."""
     np.random.seed(42)
     n = 1000
     df = pl.DataFrame({
@@ -81,14 +81,14 @@ def test_unified_api_polars():
         "fe2": np.random.randint(0, 5, n),
     })
     
-    result = fast_feols(df, formula="y ~ x | fe1 + fe2", backend="polars")
+    result = leanfe(df, formula="y ~ x | fe1 + fe2", backend="polars")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
 
 
 def test_unified_api_duckdb():
-    """Test unified fast_feols() with DuckDB backend."""
+    """Test unified leanfe() with DuckDB backend."""
     np.random.seed(42)
     n = 1000
     df = pl.DataFrame({
@@ -98,14 +98,14 @@ def test_unified_api_duckdb():
         "fe2": np.random.randint(0, 5, n),
     })
     
-    result = fast_feols(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
+    result = leanfe(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
 
 
 def test_unified_api_default_backend():
-    """Test unified fast_feols() uses Polars by default."""
+    """Test unified leanfe() uses Polars by default."""
     np.random.seed(42)
     n = 1000
     df = pl.DataFrame({
@@ -116,14 +116,14 @@ def test_unified_api_default_backend():
     })
     
     # No backend specified - should use polars
-    result = fast_feols(df, formula="y ~ x | fe1 + fe2")
+    result = leanfe(df, formula="y ~ x | fe1 + fe2")
     
     assert "coefficients" in result
     assert "x" in result["coefficients"]
 
 
 def test_unified_api_invalid_backend():
-    """Test unified fast_feols() raises error for invalid backend."""
+    """Test unified leanfe() raises error for invalid backend."""
     np.random.seed(42)
     n = 100
     df = pl.DataFrame({
@@ -134,4 +134,4 @@ def test_unified_api_invalid_backend():
     
     import pytest
     with pytest.raises(ValueError, match="backend must be"):
-        fast_feols(df, formula="y ~ x | fe1", backend="invalid")
+        leanfe(df, formula="y ~ x | fe1", backend="invalid")

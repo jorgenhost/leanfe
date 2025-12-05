@@ -23,7 +23,7 @@ df <- pl$DataFrame(
   fe2 = sample(0:4, n, replace = TRUE)
 )
 
-result <- fast_feols_polars(df, formula = "y ~ x + i(region) | fe1 + fe2")
+result <- leanfe_polars(df, formula = "y ~ x + i(region) | fe1 + fe2")
 
 # Should have coefficient for x plus 2 region dummies (A is reference)
 stopifnot("x" %in% names(result$coefficients))
@@ -36,7 +36,7 @@ cat("  (region_A is reference category)\n")
 
 # Test 2: Factor variables with DuckDB
 cat("Test 2: Factor variables (DuckDB)... ")
-result <- fast_feols_duckdb(df, formula = "y ~ x + i(region) | fe1 + fe2")
+result <- leanfe_duckdb(df, formula = "y ~ x + i(region) | fe1 + fe2")
 
 stopifnot("x" %in% names(result$coefficients))
 stopifnot("region_B" %in% names(result$coefficients))

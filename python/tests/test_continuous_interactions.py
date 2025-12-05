@@ -3,8 +3,8 @@ import polars as pl
 import numpy as np
 import pytest
 
-from leanfe.polars_impl import fast_feols_polars
-from leanfe.duckdb_impl import fast_feols_duckdb
+from leanfe.polars_impl import leanfe_polars
+from leanfe.duckdb_impl import leanfe_duckdb
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def test_binary_continuous_interaction_polars(binary_continuous_data):
         (pl.col('treatment') * pl.col('price')).alias('treatment_x_price')
     ])
     
-    result = fast_feols_polars(
+    result = leanfe_polars(
         df,
         formula="revenue ~ treatment + price + treatment_x_price | customer_id + product_id"
     )
@@ -66,7 +66,7 @@ def test_binary_continuous_interaction_duckdb(binary_continuous_data):
         (pl.col('treatment') * pl.col('price')).alias('treatment_x_price')
     ])
     
-    result = fast_feols_duckdb(
+    result = leanfe_duckdb(
         df,
         formula="revenue ~ treatment + price + treatment_x_price | customer_id + product_id"
     )
@@ -84,7 +84,7 @@ def test_binary_continuous_interaction_duckdb(binary_continuous_data):
 
 def test_continuous_main_effect_only(binary_continuous_data):
     """Test continuous variable as main effect (no interaction)."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         binary_continuous_data,
         formula="revenue ~ price | customer_id + product_id"
     )
@@ -116,7 +116,7 @@ def test_multiple_continuous_variables():
         ).alias('revenue')
     ])
     
-    result = fast_feols_polars(
+    result = leanfe_polars(
         df,
         formula="revenue ~ price + quantity | customer_id + product_id"
     )

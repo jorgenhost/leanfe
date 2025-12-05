@@ -1,6 +1,6 @@
 import polars as pl
 import numpy as np
-from leanfe import fast_feols_polars, fast_feols_duckdb
+from leanfe import leanfe_polars, leanfe_duckdb
 
 def test_factor_variables_polars():
     """Test factor variable expansion into dummies (first category dropped as reference)"""
@@ -16,7 +16,7 @@ def test_factor_variables_polars():
     })
     
     # Test with factor variable (expanded to dummies, first category dropped)
-    result = fast_feols_polars(df, formula="y ~ x + i(region) | fe1 + fe2")
+    result = leanfe_polars(df, formula="y ~ x + i(region) | fe1 + fe2")
     
     # Should have coefficient for x plus 2 region dummies (A is reference)
     assert 'x' in result['coefficients']
@@ -42,7 +42,7 @@ def test_factor_variables_duckdb():
     })
     
     # Test with factor variable (expanded to dummies, first category dropped)
-    result = fast_feols_duckdb(df, formula="y ~ x + i(region) | fe1 + fe2")
+    result = leanfe_duckdb(df, formula="y ~ x + i(region) | fe1 + fe2")
     
     # Should have coefficient for x plus 2 region dummies (A is reference)
     assert 'x' in result['coefficients']

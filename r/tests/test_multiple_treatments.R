@@ -36,7 +36,7 @@ cat("Testing multiple treatment arms...\n\n")
 
 # Test 1: Multiple binary treatments (Polars)
 cat("Test 1: Multiple binary treatments (Polars)... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df,
   formula = "revenue ~ treatment_A + treatment_B | customer_id + product_id"
 )
@@ -48,7 +48,7 @@ cat("PASSED\n")
 
 # Test 2: Multiple binary treatments (DuckDB)
 cat("Test 2: Multiple binary treatments (DuckDB)... ")
-result <- fast_feols_duckdb(
+result <- leanfe_duckdb(
   df,
   formula = "revenue ~ treatment_A + treatment_B | customer_id + product_id"
 )
@@ -60,7 +60,7 @@ cat("PASSED\n")
 
 # Test 3: Mixed treatment types (Polars)
 cat("Test 3: Mixed treatment types (Polars)... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df,
   formula = "revenue ~ treatment_A + treatment_B + treatment_C | customer_id + product_id"
 )
@@ -74,7 +74,7 @@ cat("PASSED\n")
 
 # Test 4: Multiple interactions (Polars)
 cat("Test 4: Multiple interactions (Polars)... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df,
   formula = "revenue ~ treatment_A:i(region) + treatment_B:i(region) | customer_id + product_id"
 )
@@ -86,7 +86,7 @@ cat("PASSED\n")
 
 # Test 5: Multiple interactions (DuckDB)
 cat("Test 5: Multiple interactions (DuckDB)... ")
-result <- fast_feols_duckdb(
+result <- leanfe_duckdb(
   df,
   formula = "revenue ~ treatment_A:i(region) + treatment_B:i(region) | customer_id + product_id"
 )
@@ -98,7 +98,7 @@ cat("PASSED\n")
 
 # Test 6: Multiple treatments with robust SE
 cat("Test 6: Multiple treatments with robust SE... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df,
   formula = "revenue ~ treatment_A + treatment_B | customer_id + product_id",
   vcov = "HC1"
@@ -112,7 +112,7 @@ cat("PASSED\n")
 
 # Test 7: Multiple treatments with clustered SE
 cat("Test 7: Multiple treatments with clustered SE... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df,
   formula = "revenue ~ treatment_A + treatment_B | customer_id + product_id",
   vcov = "cluster",
@@ -129,7 +129,7 @@ cat("Test 8: Multiple interactions with different factors... ")
 df_time <- df$with_columns(
   time_period = (pl$col("customer_id") %% 5)$cast(pl$String)
 )
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df_time,
   formula = "revenue ~ treatment_A:i(region) + treatment_B:i(time_period) | customer_id + product_id"
 )

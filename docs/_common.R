@@ -13,7 +13,7 @@ if (dir.exists(pkg_dir)) {
   source(file.path(pkg_dir, "common.R"))
   source(file.path(pkg_dir, "duckdb.R"))
   source(file.path(pkg_dir, "polars.R"))
-  source(file.path(pkg_dir, "fast_feols.R"))
+  source(file.path(pkg_dir, "leanfe.R"))
 } else {
   warning("Could not find leanfe R package directory")
 }

@@ -29,34 +29,34 @@ df <- df$with_columns(
 
 cat("Testing continuous treatment warnings...\n\n")
 
-# Test 1: Continuous treatment triggers warning (Polars)
-cat("Test 1: Continuous treatment warning (Polars)... ")
+# Test 1: Continuous regressor triggers warning (Polars)
+cat("Test 1: Continuous regressor warning (Polars)... ")
 result <- tryCatch({
   suppressWarnings({
-    fast_feols_polars(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
+    leanfe_polars(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
   })
 }, warning = function(w) {
-  if (grepl("Continuous treatment variable", w$message)) {
+  if (grepl("Continuous regressor", w$message)) {
     cat("WARNING DETECTED ✓\n")
     return(suppressWarnings(
-      fast_feols_polars(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
+      leanfe_polars(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
     ))
   }
 })
 stopifnot("treatment_continuous" %in% names(result$coefficients))
 cat("PASSED\n")
 
-# Test 2: Continuous treatment triggers warning (DuckDB)
-cat("Test 2: Continuous treatment warning (DuckDB)... ")
+# Test 2: Continuous regressor triggers warning (DuckDB)
+cat("Test 2: Continuous regressor warning (DuckDB)... ")
 result <- tryCatch({
   suppressWarnings({
-    fast_feols_duckdb(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
+    leanfe_duckdb(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
   })
 }, warning = function(w) {
-  if (grepl("Continuous treatment variable", w$message)) {
+  if (grepl("Continuous regressor", w$message)) {
     cat("WARNING DETECTED ✓\n")
     return(suppressWarnings(
-      fast_feols_duckdb(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
+      leanfe_duckdb(df, formula = "revenue ~ treatment_continuous | customer_id + product_id")
     ))
   }
 })
@@ -67,13 +67,13 @@ cat("PASSED\n")
 cat("Test 3: Binary treatment no warning... ")
 warned <- FALSE
 result <- tryCatch({
-  fast_feols_polars(df, formula = "revenue ~ treatment_binary | customer_id + product_id")
+  leanfe_polars(df, formula = "revenue ~ treatment_binary | customer_id + product_id")
 }, warning = function(w) {
-  if (grepl("Continuous treatment variable", w$message)) {
+  if (grepl("Continuous regressor", w$message)) {
     warned <<- TRUE
   }
   suppressWarnings(
-    fast_feols_polars(df, formula = "revenue ~ treatment_binary | customer_id + product_id")
+    leanfe_polars(df, formula = "revenue ~ treatment_binary | customer_id + product_id")
   )
 })
 stopifnot(!warned)
@@ -84,13 +84,13 @@ cat("PASSED\n")
 cat("Test 4: Mixed treatments warning... ")
 result <- tryCatch({
   suppressWarnings({
-    fast_feols_polars(df, formula = "revenue ~ treatment_binary + treatment_continuous | customer_id + product_id")
+    leanfe_polars(df, formula = "revenue ~ treatment_binary + treatment_continuous | customer_id + product_id")
   })
 }, warning = function(w) {
-  if (grepl("Continuous treatment variable", w$message)) {
+  if (grepl("Continuous regressor", w$message)) {
     cat("WARNING DETECTED ✓\n")
     return(suppressWarnings(
-      fast_feols_polars(df, formula = "revenue ~ treatment_binary + treatment_continuous | customer_id + product_id")
+      leanfe_polars(df, formula = "revenue ~ treatment_binary + treatment_continuous | customer_id + product_id")
     ))
   }
 })
@@ -114,13 +114,13 @@ df_cat <- df_cat$with_columns(
 
 warned <- FALSE
 result <- tryCatch({
-  fast_feols_polars(df_cat, formula = "revenue ~ treatment_categorical | customer_id + product_id")
+  leanfe_polars(df_cat, formula = "revenue ~ treatment_categorical | customer_id + product_id")
 }, warning = function(w) {
-  if (grepl("Continuous treatment variable", w$message)) {
+  if (grepl("Continuous regressor", w$message)) {
     warned <<- TRUE
   }
   suppressWarnings(
-    fast_feols_polars(df_cat, formula = "revenue ~ treatment_categorical | customer_id + product_id")
+    leanfe_polars(df_cat, formula = "revenue ~ treatment_categorical | customer_id + product_id")
   )
 })
 stopifnot(!warned)

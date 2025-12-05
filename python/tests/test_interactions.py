@@ -1,7 +1,7 @@
 import polars as pl
 import numpy as np
 import pytest
-from leanfe.polars_impl import fast_feols_polars
+from leanfe.polars_impl import leanfe_polars
 
 def test_interaction_basic():
     """Test basic interaction: treatment:i(region) - first category dropped as reference"""
@@ -15,7 +15,7 @@ def test_interaction_basic():
     })
     
     # Interaction syntax with robust SE
-    result = fast_feols_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", vcov="HC1")
+    result = leanfe_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", vcov="HC1")
     
     # Verify interaction terms created (first category A is reference, dropped)
     assert 'treatment_B' in result['coefficients']
@@ -35,7 +35,7 @@ def test_interaction_robust_se():
         'fe2': [i % 50 for i in range(1200)]
     })
     
-    result = fast_feols_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", vcov="HC1")
+    result = leanfe_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", vcov="HC1")
     
     assert result['vcov_type'] == 'HC1'
     assert 'treatment_B' in result['std_errors']  # A is reference
@@ -66,7 +66,7 @@ def test_interaction_clustered_se():
         ).alias('y')
     ])
     
-    result = fast_feols_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", 
+    result = leanfe_polars(df, formula="y ~ treatment:i(region) | fe1 + fe2", 
                                vcov="cluster", cluster_cols=["fe1"])
     
     assert result['vcov_type'] == 'cluster'

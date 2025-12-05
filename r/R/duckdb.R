@@ -4,7 +4,7 @@ NULL
 
 #' Fast Fixed Effects OLS using DuckDB Backend
 #'
-#' DuckDB-based implementation optimized for memory efficiency. Use \code{\link{fast_feols}} 
+#' DuckDB-based implementation optimized for memory efficiency. Use \code{\link{leanfe}} 
 #' for the recommended unified API.
 #'
 #' @param data Polars DataFrame, R data.frame, or path to parquet file.
@@ -38,9 +38,9 @@ NULL
 #'   \item{n_clusters}{Number of clusters (if clustered SEs)}
 #' }
 #'
-#' @seealso \code{\link{fast_feols}}, \code{\link{fast_feols_polars}}
+#' @seealso \code{\link{leanfe}}, \code{\link{leanfe_polars}}
 #' @export
-fast_feols_duckdb <- function(
+leanfe_duckdb <- function(
   data,
   y_col = NULL,
   x_cols = NULL,

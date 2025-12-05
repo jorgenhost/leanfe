@@ -21,7 +21,7 @@ install.packages(c("polars", "duckdb", "DBI"))
 source("R/common.R")
 source("R/polars.R")
 source("R/duckdb.R")
-source("R/fast_feols.R")
+source("R/leanfe.R")
 ```
 
 ## Running Tests
@@ -90,14 +90,14 @@ When reporting issues, please include:
 package/
 ├── python/
 │   └── leanfe/
-│       ├── fast_feols.py    # Unified API
+│       ├── leanfe.py    # Unified API
 │       ├── common.py        # Shared utilities
 │       ├── polars_impl.py   # Polars backend
 │       └── duckdb_impl.py   # DuckDB backend
 │
 └── r/
     └── R/
-        ├── fast_feols.R     # Unified API
+        ├── leanfe.R     # Unified API
         ├── common.R         # Shared utilities
         ├── polars.R         # Polars backend
         └── duckdb.R         # DuckDB backend

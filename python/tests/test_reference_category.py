@@ -4,7 +4,7 @@ import pytest
 import polars as pl
 import numpy as np
 
-from leanfe import fast_feols_polars, fast_feols_duckdb
+from leanfe import leanfe_polars, leanfe_duckdb
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def region_data():
 
 def test_default_reference_first_polars(region_data):
     """Test that default reference is first category (alphabetically)."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         region_data,
         formula="revenue ~ treatment + i(region) | customer_id + product_id"
     )
@@ -47,7 +47,7 @@ def test_default_reference_first_polars(region_data):
 
 def test_custom_reference_polars(region_data):
     """Test specifying custom reference category in Polars."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         region_data,
         formula="revenue ~ treatment + i(region, ref=R2) | customer_id + product_id"
     )
@@ -60,7 +60,7 @@ def test_custom_reference_polars(region_data):
 
 def test_custom_reference_duckdb(region_data):
     """Test specifying custom reference category in DuckDB."""
-    result = fast_feols_duckdb(
+    result = leanfe_duckdb(
         region_data,
         formula="revenue ~ treatment + i(region, ref=R3) | customer_id + product_id"
     )
@@ -73,7 +73,7 @@ def test_custom_reference_duckdb(region_data):
 
 def test_interaction_custom_reference_polars(region_data):
     """Test specifying custom reference in interaction term."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         region_data,
         formula="revenue ~ treatment:i(region, ref=R2) | customer_id + product_id"
     )
@@ -86,7 +86,7 @@ def test_interaction_custom_reference_polars(region_data):
 
 def test_interaction_custom_reference_duckdb(region_data):
     """Test specifying custom reference in interaction term (DuckDB)."""
-    result = fast_feols_duckdb(
+    result = leanfe_duckdb(
         region_data,
         formula="revenue ~ treatment:i(region, ref=R1) | customer_id + product_id"
     )
@@ -100,7 +100,7 @@ def test_interaction_custom_reference_duckdb(region_data):
 def test_invalid_reference_raises_error(region_data):
     """Test that invalid reference category raises error."""
     with pytest.raises(ValueError, match="Reference category.*not found"):
-        fast_feols_polars(
+        leanfe_polars(
             region_data,
             formula="revenue ~ treatment + i(region, ref=INVALID) | customer_id + product_id"
         )
@@ -108,7 +108,7 @@ def test_invalid_reference_raises_error(region_data):
 
 def test_quoted_reference_polars(region_data):
     """Test that quoted reference values work."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         region_data,
         formula='revenue ~ treatment + i(region, ref="R2") | customer_id + product_id'
     )

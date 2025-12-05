@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Initial release of leanfe
-- **Unified API**: `fast_feols()` function with `backend` parameter ("polars" or "duckdb")
+- **Unified API**: `leanfe()` function with `backend` parameter ("polars" or "duckdb")
 - **Polars backend**: Optimized for speed (~16x faster than PyFixest)
 - **DuckDB backend**: Optimized for memory efficiency (~100x less memory)
 - **Formula syntax**: R-style formulas like `"y ~ x1 + x2 | fe1 + fe2"`
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **IV/2SLS**: Instrumental variables via `"y ~ x | fe | z"` syntax
 - **Standard errors**: IID, HC1 (robust), and clustered (one-way and multi-way)
 - **Weighted regression**: WLS via `weights` parameter
-- **Continuous treatment warnings**: Alerts when treatment variables appear continuous
+- **Continuous regressor warnings**: Alerts when regressors appear continuous
 - **Python package**: `leanfe` with full test coverage (39 tests)
 - **R package**: `fasthdferg` with full test coverage (39 tests)
 - **Cross-platform consistency**: Identical API and results in Python and R

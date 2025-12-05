@@ -3,8 +3,8 @@ import polars as pl
 import numpy as np
 import pytest
 
-from leanfe.polars_impl import fast_feols_polars
-from leanfe.duckdb_impl import fast_feols_duckdb
+from leanfe.polars_impl import leanfe_polars
+from leanfe.duckdb_impl import leanfe_duckdb
 
 
 @pytest.fixture
@@ -40,7 +40,7 @@ def multi_treatment_data():
 
 def test_multiple_binary_treatments_polars(multi_treatment_data):
     """Test multiple binary treatments with Polars."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         multi_treatment_data,
         formula="revenue ~ treatment_A + treatment_B | customer_id + product_id"
     )
@@ -60,7 +60,7 @@ def test_multiple_binary_treatments_polars(multi_treatment_data):
 
 def test_multiple_binary_treatments_duckdb(multi_treatment_data):
     """Test multiple binary treatments with DuckDB."""
-    result = fast_feols_duckdb(
+    result = leanfe_duckdb(
         multi_treatment_data,
         formula="revenue ~ treatment_A + treatment_B | customer_id + product_id"
     )
@@ -76,7 +76,7 @@ def test_multiple_binary_treatments_duckdb(multi_treatment_data):
 
 def test_mixed_treatment_types_polars(multi_treatment_data):
     """Test mixing binary and categorical treatments with Polars."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         multi_treatment_data,
         formula="revenue ~ treatment_A + treatment_B + treatment_C | customer_id + product_id"
     )
@@ -94,7 +94,7 @@ def test_mixed_treatment_types_polars(multi_treatment_data):
 
 def test_multiple_interactions_polars(multi_treatment_data):
     """Test multiple treatment interactions with Polars."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         multi_treatment_data,
         formula="revenue ~ treatment_A:i(region) + treatment_B:i(region) | customer_id + product_id"
     )
@@ -114,7 +114,7 @@ def test_multiple_interactions_polars(multi_treatment_data):
 
 def test_multiple_interactions_duckdb(multi_treatment_data):
     """Test multiple treatment interactions with DuckDB."""
-    result = fast_feols_duckdb(
+    result = leanfe_duckdb(
         multi_treatment_data,
         formula="revenue ~ treatment_A:i(region) + treatment_B:i(region) | customer_id + product_id"
     )
@@ -130,7 +130,7 @@ def test_multiple_interactions_duckdb(multi_treatment_data):
 
 def test_multiple_treatments_with_robust_se(multi_treatment_data):
     """Test multiple treatments with HC1 robust standard errors."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         multi_treatment_data,
         formula="revenue ~ treatment_A + treatment_B | customer_id + product_id",
         vcov="HC1"
@@ -145,7 +145,7 @@ def test_multiple_treatments_with_robust_se(multi_treatment_data):
 
 def test_multiple_treatments_with_clustered_se(multi_treatment_data):
     """Test multiple treatments with clustered standard errors."""
-    result = fast_feols_polars(
+    result = leanfe_polars(
         multi_treatment_data,
         formula="revenue ~ treatment_A + treatment_B | customer_id + product_id",
         vcov="cluster",
@@ -165,7 +165,7 @@ def test_multiple_interactions_different_factors(multi_treatment_data):
         (pl.col('customer_id') % 5).alias('time_period')
     ])
     
-    result = fast_feols_polars(
+    result = leanfe_polars(
         df,
         formula="revenue ~ treatment_A:i(region) + treatment_B:i(time_period) | customer_id + product_id"
     )

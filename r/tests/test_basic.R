@@ -7,7 +7,7 @@ library(DBI)
 source("R/common.R")
 source("R/polars.R")
 source("R/duckdb.R")
-source("R/fast_feols.R")
+source("R/leanfe.R")
 
 set.seed(42)
 n <- 1000
@@ -23,7 +23,7 @@ df <- pl$DataFrame(
   fe2 = sample(0:4, n, replace = TRUE)
 )
 
-result <- fast_feols_polars(df, y_col = "y", x_cols = "x", fe_cols = c("fe1", "fe2"))
+result <- leanfe_polars(df, y_col = "y", x_cols = "x", fe_cols = c("fe1", "fe2"))
 
 stopifnot("coefficients" %in% names(result))
 stopifnot("std_errors" %in% names(result))
@@ -33,7 +33,7 @@ cat("PASSED\n")
 
 # Test 2: Formula API
 cat("Test 2: Formula API... ")
-result <- fast_feols_polars(df, formula = "y ~ x | fe1 + fe2")
+result <- leanfe_polars(df, formula = "y ~ x | fe1 + fe2")
 
 stopifnot("coefficients" %in% names(result))
 stopifnot("x" %in% names(result$coefficients))
@@ -49,15 +49,15 @@ df_cluster <- pl$DataFrame(
 )
 
 # IID
-result_iid <- fast_feols_polars(df_cluster, y_col = "y", x_cols = "x", fe_cols = "fe1", vcov = "iid")
+result_iid <- leanfe_polars(df_cluster, y_col = "y", x_cols = "x", fe_cols = "fe1", vcov = "iid")
 stopifnot(result_iid$vcov_type == "iid")
 
 # HC1
-result_hc1 <- fast_feols_polars(df_cluster, y_col = "y", x_cols = "x", fe_cols = "fe1", vcov = "HC1")
+result_hc1 <- leanfe_polars(df_cluster, y_col = "y", x_cols = "x", fe_cols = "fe1", vcov = "HC1")
 stopifnot(result_hc1$vcov_type == "HC1")
 
 # Clustered
-result_cluster <- fast_feols_polars(
+result_cluster <- leanfe_polars(
   df_cluster, 
   y_col = "y", 
   x_cols = "x", 
@@ -71,19 +71,19 @@ cat("PASSED\n")
 
 # Test 4: Unified API with Polars backend
 cat("Test 4: Unified API (backend='polars')... ")
-result_unified <- fast_feols(df, formula = "y ~ x | fe1 + fe2", backend = "polars")
+result_unified <- leanfe(df, formula = "y ~ x | fe1 + fe2", backend = "polars")
 stopifnot("x" %in% names(result_unified$coefficients))
 cat("PASSED\n")
 
 # Test 5: Unified API with DuckDB backend
 cat("Test 5: Unified API (backend='duckdb')... ")
-result_duckdb <- fast_feols(df, formula = "y ~ x | fe1 + fe2", backend = "duckdb")
+result_duckdb <- leanfe(df, formula = "y ~ x | fe1 + fe2", backend = "duckdb")
 stopifnot("x" %in% names(result_duckdb$coefficients))
 cat("PASSED\n")
 
 # Test 6: Unified API default backend (polars)
 cat("Test 6: Unified API (default backend)... ")
-result_default <- fast_feols(df, formula = "y ~ x | fe1 + fe2")
+result_default <- leanfe(df, formula = "y ~ x | fe1 + fe2")
 stopifnot("x" %in% names(result_default$coefficients))
 cat("PASSED\n")
 
@@ -91,7 +91,7 @@ cat("PASSED\n")
 cat("Test 7: Unified API (invalid backend)... ")
 error_caught <- FALSE
 tryCatch({
-  fast_feols(df, formula = "y ~ x | fe1", backend = "invalid")
+  leanfe(df, formula = "y ~ x | fe1", backend = "invalid")
 }, error = function(e) {
   if (grepl("backend must be", e$message)) {
     error_caught <<- TRUE

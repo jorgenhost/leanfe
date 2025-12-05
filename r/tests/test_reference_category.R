@@ -30,7 +30,7 @@ cat("Testing reference category selection...\n\n")
 
 # Test 1: Default reference (first category)
 cat("Test 1: Default reference is first category (Polars)... ")
-result <- fast_feols_polars(df, formula = "revenue ~ treatment + i(region) | customer_id + product_id")
+result <- leanfe_polars(df, formula = "revenue ~ treatment + i(region) | customer_id + product_id")
 stopifnot("region_R2" %in% names(result$coefficients))
 stopifnot("region_R3" %in% names(result$coefficients))
 stopifnot(!("region_R1" %in% names(result$coefficients)))  # R1 is reference
@@ -38,7 +38,7 @@ cat("PASSED\n")
 
 # Test 2: Custom reference (Polars)
 cat("Test 2: Custom reference category (Polars)... ")
-result <- fast_feols_polars(df, formula = "revenue ~ treatment + i(region, ref=R2) | customer_id + product_id")
+result <- leanfe_polars(df, formula = "revenue ~ treatment + i(region, ref=R2) | customer_id + product_id")
 stopifnot("region_R1" %in% names(result$coefficients))
 stopifnot("region_R3" %in% names(result$coefficients))
 stopifnot(!("region_R2" %in% names(result$coefficients)))  # R2 is reference
@@ -46,7 +46,7 @@ cat("PASSED\n")
 
 # Test 3: Custom reference (DuckDB)
 cat("Test 3: Custom reference category (DuckDB)... ")
-result <- fast_feols_duckdb(df, formula = "revenue ~ treatment + i(region, ref=R3) | customer_id + product_id")
+result <- leanfe_duckdb(df, formula = "revenue ~ treatment + i(region, ref=R3) | customer_id + product_id")
 stopifnot("region_R1" %in% names(result$coefficients))
 stopifnot("region_R2" %in% names(result$coefficients))
 stopifnot(!("region_R3" %in% names(result$coefficients)))  # R3 is reference
@@ -54,7 +54,7 @@ cat("PASSED\n")
 
 # Test 4: Interaction with custom reference (Polars)
 cat("Test 4: Interaction with custom reference (Polars)... ")
-result <- fast_feols_polars(df, formula = "revenue ~ treatment:i(region, ref=R2) | customer_id + product_id")
+result <- leanfe_polars(df, formula = "revenue ~ treatment:i(region, ref=R2) | customer_id + product_id")
 stopifnot("treatment_R1" %in% names(result$coefficients))
 stopifnot("treatment_R3" %in% names(result$coefficients))
 stopifnot(!("treatment_R2" %in% names(result$coefficients)))  # R2 is reference
@@ -62,7 +62,7 @@ cat("PASSED\n")
 
 # Test 5: Interaction with custom reference (DuckDB)
 cat("Test 5: Interaction with custom reference (DuckDB)... ")
-result <- fast_feols_duckdb(df, formula = "revenue ~ treatment:i(region, ref=R1) | customer_id + product_id")
+result <- leanfe_duckdb(df, formula = "revenue ~ treatment:i(region, ref=R1) | customer_id + product_id")
 stopifnot("treatment_R2" %in% names(result$coefficients))
 stopifnot("treatment_R3" %in% names(result$coefficients))
 stopifnot(!("treatment_R1" %in% names(result$coefficients)))  # R1 is reference
@@ -72,7 +72,7 @@ cat("PASSED\n")
 cat("Test 6: Invalid reference raises error... ")
 error_caught <- FALSE
 tryCatch({
-  fast_feols_polars(df, formula = "revenue ~ treatment + i(region, ref=INVALID) | customer_id + product_id")
+  leanfe_polars(df, formula = "revenue ~ treatment + i(region, ref=INVALID) | customer_id + product_id")
 }, error = function(e) {
   if (grepl("not found", e$message)) {
     error_caught <<- TRUE
@@ -83,7 +83,7 @@ cat("PASSED\n")
 
 # Test 7: Quoted reference values work
 cat("Test 7: Quoted reference values... ")
-result <- fast_feols_polars(df, formula = 'revenue ~ treatment + i(region, ref="R2") | customer_id + product_id')
+result <- leanfe_polars(df, formula = 'revenue ~ treatment + i(region, ref="R2") | customer_id + product_id')
 stopifnot("region_R1" %in% names(result$coefficients))
 stopifnot("region_R3" %in% names(result$coefficients))
 stopifnot(!("region_R2" %in% names(result$coefficients)))  # R2 is reference

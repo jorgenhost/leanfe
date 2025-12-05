@@ -18,7 +18,7 @@ from .common import (
 )
 
 
-def fast_feols_duckdb(
+def leanfe_duckdb(
     data: Union[str, pl.DataFrame],
     y_col: Optional[str] = None,
     x_cols: Optional[List[str]] = None,
@@ -146,14 +146,14 @@ def fast_feols_duckdb(
                     x_cols.append(col_name)
         
         # Check for continuous treatment variables
-        continuous_treatments = []
+        continuous_regressors = []
         for col in x_cols:
             result = con.execute(f"SELECT COUNT(DISTINCT {col}) FROM data").fetchone()[0]
             if result > 10:
-                continuous_treatments.append(col)
-        if continuous_treatments:
+                continuous_regressors.append(col)
+        if continuous_regressors:
             warnings.warn(
-                f"Continuous treatment variable(s) detected: {continuous_treatments}.",
+                f"Continuous regressor(s) detected: {continuous_regressors}.",
                 UserWarning, stacklevel=2
             )
         

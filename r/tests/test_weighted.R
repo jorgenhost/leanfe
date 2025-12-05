@@ -27,7 +27,7 @@ df <- pl$DataFrame(
   weights = weights
 )
 
-result <- fast_feols_polars(df, y_col = "y", x_cols = "x", fe_cols = "fe1", weights = "weights")
+result <- leanfe_polars(df, y_col = "y", x_cols = "x", fe_cols = "fe1", weights = "weights")
 
 stopifnot("coefficients" %in% names(result))
 stopifnot("x" %in% names(result$coefficients))
@@ -43,7 +43,7 @@ df <- pl$DataFrame(
   weights = runif(n, 0.5, 2.0)
 )
 
-result <- fast_feols_polars(df, formula = "y ~ x | fe1", weights = "weights")
+result <- leanfe_polars(df, formula = "y ~ x | fe1", weights = "weights")
 
 stopifnot("coefficients" %in% names(result))
 stopifnot("x" %in% names(result$coefficients))
@@ -51,7 +51,7 @@ cat("PASSED\n")
 
 # Test 3: Weighted regression with HC1 standard errors
 cat("Test 3: Weighted regression with HC1 SE... ")
-result <- fast_feols_polars(
+result <- leanfe_polars(
   df, 
   y_col = "y", 
   x_cols = "x", 

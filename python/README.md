@@ -33,16 +33,16 @@ pip install -e .
 ## Quick Start
 
 ```python
-from leanfe import fast_feols
+from leanfe import leanfe
 import polars as pl
 
 df = pl.read_parquet("data.parquet")
 
 # Default: uses Polars backend (fastest)
-result = fast_feols(df, formula="revenue ~ treatment | customer_id + product_id + day")
+result = leanfe(df, formula="revenue ~ treatment | customer_id + product_id + day")
 
 # For very large datasets: use DuckDB backend (lowest memory)
-result = fast_feols(
+result = leanfe(
     df, 
     formula="revenue ~ treatment | customer_id + product_id + day",
     backend="duckdb"
@@ -74,10 +74,10 @@ The `backend` parameter controls which implementation is used:
 
 ```python
 # Polars: ~6s, ~300 MB (default)
-result = fast_feols(df, formula="y ~ x | fe1 + fe2")
+result = leanfe(df, formula="y ~ x | fe1 + fe2")
 
 # DuckDB: ~18s, ~30 MB
-result = fast_feols(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
+result = leanfe(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
 ```
 
 ## Features
@@ -86,7 +86,7 @@ result = fast_feols(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
 
 ```python
 # One-way clustering
-result = fast_feols(
+result = leanfe(
     df, 
     formula="y ~ x | fe1 + fe2",
     vcov="cluster",
@@ -94,7 +94,7 @@ result = fast_feols(
 )
 
 # Multi-way clustering
-result = fast_feols(
+result = leanfe(
     df, 
     formula="y ~ x | fe1 + fe2",
     vcov="cluster",
@@ -106,11 +106,11 @@ result = fast_feols(
 
 ```python
 # Expand categorical variable into dummies (first category is reference by default)
-result = fast_feols(df, formula="y ~ treatment + i(region) | customer + product")
+result = leanfe(df, formula="y ~ treatment + i(region) | customer + product")
 # Creates: treatment, region_B, region_C (region_A is reference)
 
 # Specify custom reference category
-result = fast_feols(df, formula="y ~ treatment + i(region, ref=B) | customer + product")
+result = leanfe(df, formula="y ~ treatment + i(region, ref=B) | customer + product")
 # Creates: treatment, region_A, region_C (region_B is reference)
 ```
 
@@ -118,11 +118,11 @@ result = fast_feols(df, formula="y ~ treatment + i(region, ref=B) | customer + p
 
 ```python
 # Heterogeneous treatment effects by region
-result = fast_feols(df, formula="y ~ treatment:i(region) | customer + product")
+result = leanfe(df, formula="y ~ treatment:i(region) | customer + product")
 # Creates: treatment_B, treatment_C (treatment effect for each region vs. reference A)
 
 # With custom reference category
-result = fast_feols(df, formula="y ~ treatment:i(region, ref=B) | customer + product")
+result = leanfe(df, formula="y ~ treatment:i(region, ref=B) | customer + product")
 # Creates: treatment_A, treatment_C (treatment effect relative to region B)
 ```
 
@@ -130,21 +130,21 @@ result = fast_feols(df, formula="y ~ treatment:i(region, ref=B) | customer + pro
 
 ```python
 # Two-stage least squares
-result = fast_feols(df, formula="y ~ x | fe1 + fe2 | z1 + z2")
+result = leanfe(df, formula="y ~ x | fe1 + fe2 | z1 + z2")
 # x is endogenous, z1 and z2 are instruments
 ```
 
 ### Weighted Regression
 
 ```python
-result = fast_feols(df, formula="y ~ x | fe1 + fe2", weights="weight_col")
+result = leanfe(df, formula="y ~ x | fe1 + fe2", weights="weight_col")
 ```
 
 ### Difference-in-Differences
 
 ```python
 # Classic TWFE DiD
-result = fast_feols(
+result = leanfe(
     df, 
     formula="y ~ treated_post | state + year",
     vcov="cluster", 
@@ -152,7 +152,7 @@ result = fast_feols(
 )
 
 # Event study
-result = fast_feols(
+result = leanfe(
     df,
     formula="y ~ lead2 + lead1 + lag0 + lag1 + lag2 | state + year", 
     vcov="cluster", 
@@ -162,10 +162,10 @@ result = fast_feols(
 
 ## API Reference
 
-### fast_feols()
+### leanfe()
 
 ```python
-fast_feols(
+leanfe(
     data: Union[str, pl.DataFrame],
     formula: str,
     vcov: str = "iid",              # "iid", "HC1", or "cluster"
@@ -205,11 +205,11 @@ fast_feols(
 For advanced use cases, you can also import the backend-specific functions directly:
 
 ```python
-from leanfe import fast_feols_polars, fast_feols_duckdb
+from leanfe import leanfe_polars, leanfe_duckdb
 
-# These have the same API as fast_feols() minus the backend parameter
-result = fast_feols_polars(df, formula="y ~ x | fe")
-result = fast_feols_duckdb(df, formula="y ~ x | fe")
+# These have the same API as leanfe() minus the backend parameter
+result = leanfe_polars(df, formula="y ~ x | fe")
+result = leanfe_duckdb(df, formula="y ~ x | fe")
 ```
 
 ## Formula Syntax

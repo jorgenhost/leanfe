@@ -40,7 +40,7 @@ df_interact <- df$with_columns(
   treatment_x_price = pl$col("treatment") * pl$col("price")
 )
 
-result <- suppressWarnings(fast_feols_polars(
+result <- suppressWarnings(leanfe_polars(
   df_interact,
   formula = "revenue ~ treatment + price + treatment_x_price | customer_id + product_id"
 ))
@@ -59,7 +59,7 @@ cat("PASSED\n")
 # Test 2: Binary × continuous interaction (DuckDB)
 cat("Test 2: Binary × continuous interaction (DuckDB)... ")
 
-result <- suppressWarnings(fast_feols_duckdb(
+result <- suppressWarnings(leanfe_duckdb(
   df_interact,
   formula = "revenue ~ treatment + price + treatment_x_price | customer_id + product_id"
 ))
@@ -76,7 +76,7 @@ cat("PASSED\n")
 # Test 3: Continuous main effect only
 cat("Test 3: Continuous main effect only... ")
 
-result <- suppressWarnings(fast_feols_polars(
+result <- suppressWarnings(leanfe_polars(
   df,
   formula = "revenue ~ price | customer_id + product_id"
 ))
@@ -103,7 +103,7 @@ df_multi <- df_multi$with_columns(
     pl$lit(rnorm(n, 0, 1))
 )
 
-result <- suppressWarnings(fast_feols_polars(
+result <- suppressWarnings(leanfe_polars(
   df_multi,
   formula = "revenue ~ price + quantity | customer_id + product_id"
 ))
