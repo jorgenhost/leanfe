@@ -1,33 +1,19 @@
 ---
 title: "Difference-in-Differences & Event Studies"
-subtitle: "Causal inference with two-way fixed effects"
+subtitle: "Two-way fixed effects with leanfe"
 ---
 
 ## Overview
 
-Difference-in-Differences (DiD) is a powerful method for estimating causal effects from panel data. This tutorial covers:
+This tutorial shows how to use `leanfe` for:
 
-- Classic two-way fixed effects (TWFE) specification
-- Event study designs for dynamic treatment effects
-- Visualizing parallel trends and treatment effects
-- Proper clustering for inference
+- Two-way fixed effects (TWFE) DiD estimation
+- Event study regressions with lead/lag indicators
+- Clustered standard errors
 
-## The DiD Setup
+## Example Data
 
-DiD requires:
-
-1. **Panel data**: Multiple units observed over multiple time periods
-2. **Treatment variation**: Some units get treated at a specific time, others don't
-3. **Parallel trends**: Treated and control units would have followed similar trends absent treatment
-
-## Simulating a Policy Evaluation
-
-Let's simulate a clean policy evaluation with:
-
-- 100 states observed over 20 years (2005-2024)
-- 40 states receive treatment starting in 2015
-- Clear parallel trends pre-treatment
-- Immediate and persistent treatment effect of 3 units
+Panel of 100 states over 20 years, with 40 states treated starting in 2015:
 
 ```{python}
 #| echo: true
@@ -44,63 +30,39 @@ n_states = 100
 years = list(range(2005, 2025))
 n_years = len(years)
 treatment_year = 2015
-treated_states = set(range(1, 41))  # States 1-40 are treated
+treated_states = set(range(1, 41))
 true_effect = 3.0
 
-# Generate state and year fixed effects
+# Generate fixed effects
 state_fes = {s: np.random.normal(0, 5) for s in range(1, n_states + 1)}
-year_fes = {y: 0.2 * (y - 2005) for y in years}  # Common upward trend
+year_fes = {y: 0.2 * (y - 2005) for y in years}
 
-# Generate panel data
+# Generate panel
 data = []
 for state in range(1, n_states + 1):
     is_treated = state in treated_states
-    
     for year in years:
-        # Event time (relative to treatment year)
         event_time = year - treatment_year if is_treated else None
-        
-        # Treatment indicator
         post = 1 if year >= treatment_year else 0
         treated_post = float(is_treated and post)
-        
-        # Outcome: parallel trends + treatment effect + noise
-        y = (state_fes[state] + 
-             year_fes[year] + 
-             true_effect * treated_post + 
-             np.random.normal(0, 1))
-        
+        y = (state_fes[state] + year_fes[year] + 
+             true_effect * treated_post + np.random.normal(0, 1))
         data.append({
-            "state_id": state,
-            "year": year,
-            "event_time": event_time,
-            "treated": float(is_treated),
-            "post": float(post),
-            "treated_post": treated_post,
-            "y": y
+            "state_id": state, "year": year, "event_time": event_time,
+            "treated": float(is_treated), "treated_post": treated_post, "y": y
         })
 
 df = pl.DataFrame(data)
-print(f"Panel: {df.shape[0]:,} observations ({n_states} states × {n_years} years)")
-print(f"Treated states: {len(treated_states)} | Control states: {n_states - len(treated_states)}")
-print(f"Treatment year: {treatment_year}")
+print(f"Panel: {df.shape[0]:,} obs ({n_states} states × {n_years} years)")
+print(f"Treated: {len(treated_states)} states starting {treatment_year}")
 ```
 
-## Classic TWFE Estimation
-
-The standard DiD model with two-way fixed effects:
-
-```
-y ~ treated_post | state + year
-```
-
-The coefficient on `treated_post` is the **average treatment effect on the treated (ATT)**.
+## TWFE Estimation
 
 ```{python}
 #| echo: true
 #| output: true
 
-# Estimate DiD with TWFE
 result = leanfe(
     formula="y ~ treated_post | state_id + year",
     data=df,
@@ -108,27 +70,21 @@ result = leanfe(
     cluster_cols=["state_id"]
 )
 
-print(f"True treatment effect: {true_effect}")
-print(f"Estimated effect:      {result['coefficients']['treated_post']:.4f}")
-print(f"Clustered SE:          {result['std_errors']['treated_post']:.4f}")
-print(f"Number of clusters:    {result['n_clusters']}")
+print(f"True effect: {true_effect}")
+print(f"Estimated:   {result['coefficients']['treated_post']:.4f}")
+print(f"SE:          {result['std_errors']['treated_post']:.4f}")
+print(f"Clusters:    {result['n_clusters']}")
 ```
 
-## Event Study Design
+## Event Study
 
-Event studies extend DiD to examine:
-
-- **Pre-treatment periods**: Test the parallel trends assumption
-- **Post-treatment periods**: Show how treatment effects evolve over time
-
-### Creating Event Time Indicators
+Create indicators for each period relative to treatment:
 
 ```{python}
 #| echo: true
 #| output: true
 
-# Create event time dummies for periods -5 to +9
-# Reference period: t = -1 (omitted)
+# Event time dummies (-5 to +9, omitting t=-1)
 event_window = list(range(-5, 10))
 reference_period = -1
 
@@ -137,34 +93,14 @@ for et in event_window:
         continue
     col_name = f"et_m{abs(et)}" if et < 0 else f"et_p{et}"
     df = df.with_columns(
-        pl.when(pl.col("event_time") == et)
-        .then(1.0)
-        .otherwise(0.0)
-        .alias(col_name)
+        pl.when(pl.col("event_time") == et).then(1.0).otherwise(0.0).alias(col_name)
     )
 
-# Build formula
 et_vars = [f"et_m{abs(et)}" if et < 0 else f"et_p{et}" 
            for et in event_window if et != reference_period]
 formula = f"y ~ {' + '.join(et_vars)} | state_id + year"
 
-print(f"Event time indicators: {len(et_vars)} dummies")
-print(f"Reference period: t = {reference_period}")
-```
-
-### Event Study Regression
-
-```{python}
-#| echo: true
-#| output: true
-
-# Run event study
-result_es = leanfe(
-    formula=formula,
-    data=df,
-    vcov="cluster",
-    cluster_cols=["state_id"]
-)
+result_es = leanfe(formula=formula, data=df, vcov="cluster", cluster_cols=["state_id"])
 
 # Extract coefficients
 coefs = []
@@ -187,7 +123,7 @@ coef_df = pl.DataFrame(coefs).sort("event_time")
 ```{python}
 #| echo: true
 #| output: true
-#| fig-cap: "Event Study: Parallel Trends and Treatment Effect"
+#| fig-cap: "Event Study Plot"
 #| label: fig-event-study
 
 import matplotlib.pyplot as plt
@@ -198,16 +134,9 @@ et = coef_df["event_time"].to_numpy()
 coef = coef_df["coef"].to_numpy()
 se = coef_df["se"].to_numpy()
 
-# Confidence intervals
-ci_lower = coef - 1.96 * se
-ci_upper = coef + 1.96 * se
-
-# Plot confidence interval band
-ax.fill_between(et, ci_lower, ci_upper, alpha=0.2, color='steelblue')
-
-# Plot coefficients
-ax.plot(et, coef, 'o-', color='steelblue', markersize=8, linewidth=2, 
-        label='Point estimate')
+# Plot with confidence bands
+ax.fill_between(et, coef - 1.96*se, coef + 1.96*se, alpha=0.2, color='steelblue')
+ax.plot(et, coef, 'o-', color='steelblue', markersize=8, linewidth=2, label='Estimate ± 95% CI')
 
 # Reference lines
 ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.8)
@@ -215,20 +144,11 @@ ax.axhline(y=true_effect, color='darkgreen', linestyle='--', linewidth=1.5,
            alpha=0.7, label=f'True effect = {true_effect}')
 ax.axvline(x=-0.5, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
 
-# Annotations
-ax.annotate('Treatment\nbegins', xy=(-0.5, true_effect + 0.3), 
-            fontsize=10, ha='center', color='red')
-ax.annotate('Pre-treatment:\nParallel trends', xy=(-3, 0.5), 
-            fontsize=10, ha='center', color='gray',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-ax.annotate('Post-treatment:\nTreatment effect', xy=(4, true_effect - 0.5), 
-            fontsize=10, ha='center', color='gray',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+ax.annotate('Treatment', xy=(-0.5, true_effect + 0.3), fontsize=10, ha='center', color='red')
 
-# Labels
 ax.set_xlabel('Years relative to treatment', fontsize=12)
 ax.set_ylabel('Coefficient (relative to t = -1)', fontsize=12)
-ax.set_title('Event Study: Clear Parallel Trends and Treatment Effect', fontsize=14)
+ax.set_title('Event Study', fontsize=14)
 ax.set_xticks(event_window)
 ax.set_xlim(-6, 10)
 ax.legend(loc='upper left')
@@ -238,83 +158,31 @@ plt.tight_layout()
 plt.show()
 ```
 
-## Interpreting the Event Study
-
-The plot shows the classic pattern we want to see:
-
-1. **Pre-treatment (t < 0)**: Coefficients are close to zero and statistically insignificant, confirming **parallel trends**
-2. **Treatment onset (t = 0)**: Sharp jump to the treatment effect
-3. **Post-treatment (t > 0)**: Coefficients remain stable around the true effect of 3
-
-This pattern provides strong evidence that:
-
-- The parallel trends assumption holds
-- The treatment effect is real and immediate
-- The effect persists over time
-
-## Choosing the Reference Period
-
-| Reference | When to use |
-|-----------|-------------|
-| `t = -1` | Standard choice, period just before treatment |
-| `t = -2` | If anticipation effects are possible |
-| Average of pre-periods | For more stable baseline |
-
-## Clustering Standard Errors
-
-Always cluster at the level where treatment varies:
+## Comparing Standard Errors
 
 ```{python}
 #| echo: true
 #| output: true
 
-# Compare IID vs clustered SEs
-result_iid = leanfe(
-    formula="y ~ treated_post | state_id + year",
-    data=df,
-    vcov="iid"
-)
-
-result_cluster = leanfe(
-    formula="y ~ treated_post | state_id + year",
-    data=df,
-    vcov="cluster",
-    cluster_cols=["state_id"]
-)
+result_iid = leanfe("y ~ treated_post | state_id + year", data=df, vcov="iid")
+result_cluster = leanfe("y ~ treated_post | state_id + year", data=df, 
+                        vcov="cluster", cluster_cols=["state_id"])
 
 print("Standard Error Comparison:")
-print(f"  IID SE:       {result_iid['std_errors']['treated_post']:.4f}")
-print(f"  Clustered SE: {result_cluster['std_errors']['treated_post']:.4f}")
-print(f"  Ratio:        {result_cluster['std_errors']['treated_post'] / result_iid['std_errors']['treated_post']:.2f}x")
+print(f"  IID:       {result_iid['std_errors']['treated_post']:.4f}")
+print(f"  Clustered: {result_cluster['std_errors']['treated_post']:.4f}")
 ```
 
-Clustered SEs are typically larger, reflecting within-state correlation.
+## Quick Reference
 
-## Limitations: Staggered Adoption
-
-⚠️ **Important**: The classic TWFE estimator can be biased when:
-
-1. **Treatment timing varies** across units (staggered adoption)
-2. **Treatment effects are heterogeneous** across units or time
-
-In these cases, consider alternative estimators:
-
-- Callaway & Sant'Anna (2021)
-- Sun & Abraham (2021)  
-- de Chaisemartin & D'Haultfœuille (2020)
-
-## Summary
-
-| Component | Recommendation |
-|-----------|----------------|
+| Task | Formula |
+|------|---------|
 | Basic DiD | `y ~ treated_post \| unit + time` |
-| Event study | Create dummies for each event time, omit t = -1 |
-| Standard errors | Cluster at treatment unit level |
-| Parallel trends | Pre-treatment coefficients should be ≈ 0 |
-| Interpretation | ATT for treated units post-treatment |
+| Event study | `y ~ et_m5 + et_m4 + ... + et_p9 \| unit + time` |
+| With covariates | `y ~ treated_post + x1 + x2 \| unit + time` |
 
 ## Next Steps
 
-- [IV Regression](iv-regression.qmd) - Address endogeneity
-- [Factor Variables](factor-variables.qmd) - Heterogeneous effects by group
-- [Large Datasets](../guides/large-datasets.qmd) - Scale to big data
+- [IV Regression](iv-regression.qmd)
+- [Factor Variables](factor-variables.qmd)
+- [Large Datasets](../guides/large-datasets.qmd)

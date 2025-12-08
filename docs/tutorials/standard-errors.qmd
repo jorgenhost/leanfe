@@ -1,26 +1,21 @@
 ---
 title: "Standard Errors"
-subtitle: "IID, heteroskedasticity-robust, and clustered"
+subtitle: "IID, HC1, and clustered"
 ---
 
 ## Overview
 
-Choosing the right standard errors is crucial for valid inference. This tutorial covers:
+This tutorial shows the standard error options available in `leanfe`.
 
-- IID standard errors
-- HC1 (heteroskedasticity-robust) standard errors
-- One-way and multi-way clustering
-- When to use each type
+## Options
 
-## Standard Error Options
-
-| Type | Syntax | Use When |
-|------|--------|----------|
-| IID | `vcov="iid"` | Homoskedastic, independent errors |
-| HC1 | `vcov="HC1"` | Heteroskedasticity present |
+| Type | Syntax | Description |
+|------|--------|-------------|
+| IID | `vcov="iid"` | Homoskedastic errors |
+| HC1 | `vcov="HC1"` | Heteroskedasticity-robust |
 | Clustered | `vcov="cluster"` | Correlation within groups |
 
-## Setup
+## Example Data
 
 ```{python}
 #| echo: true
@@ -33,159 +28,101 @@ from leanfe import leanfe
 np.random.seed(42)
 n_obs = 50_000
 
-# Generate panel data with heteroskedasticity and clustering
 firm_id = np.random.randint(1, 101, n_obs)
 year = np.random.randint(2015, 2025, n_obs)
 treatment = np.random.binomial(1, 0.3, n_obs).astype(float)
 x1 = np.random.normal(0, 1, n_obs)
 
-# Heteroskedastic errors (variance depends on x1)
-error_sd = 0.5 + 0.5 * np.abs(x1)
-error = np.random.normal(0, error_sd)
+# Heteroskedastic + clustered errors
+error = np.random.normal(0, 0.5 + 0.5 * np.abs(x1)) + np.random.normal(0, 0.5, 101)[firm_id]
 
-# Add firm-level correlation (clustered errors)
-firm_shock = np.random.normal(0, 0.5, 101)[firm_id]
-error = error + firm_shock
-
-# Fixed effects
-firm_fe = np.random.normal(0, 1, 101)[firm_id]
-year_fe = np.random.normal(0, 0.3, 11)[year - 2015]
-
-y = 2.5 * treatment + 1.5 * x1 + firm_fe + year_fe + error
+y = 2.5 * treatment + 1.5 * x1 + np.random.normal(0, 1, 101)[firm_id] + error
 
 df = pl.DataFrame({
-    "y": y,
-    "treatment": treatment,
-    "x1": x1,
-    "firm_id": firm_id,
-    "year": year,
+    "y": y, "treatment": treatment, "x1": x1, "firm_id": firm_id, "year": year
 })
 
-print(f"Data: {n_obs} observations, {df['firm_id'].n_unique()} firms")
+print(f"Data: {n_obs:,} obs, {df['firm_id'].n_unique()} firms")
 ```
 
-## IID Standard Errors
-
-Assumes errors are independent and identically distributed:
+## IID
 
 ```{python}
 #| echo: true
 #| output: true
 
-result_iid = leanfe(
-    formula="y ~ treatment + x1 | firm_id + year",
-    data=df,
-    vcov="iid"
-)
+result_iid = leanfe("y ~ treatment + x1 | firm_id + year", data=df, vcov="iid")
 
-print("IID Standard Errors:")
+print("IID:")
 for var in ["treatment", "x1"]:
-    print(f"  {var}: coef={result_iid['coefficients'][var]:.4f}, SE={result_iid['std_errors'][var]:.4f}")
+    print(f"  {var}: {result_iid['coefficients'][var]:.4f} (SE: {result_iid['std_errors'][var]:.4f})")
 ```
 
-⚠️ IID SEs are **too small** when errors are heteroskedastic or clustered.
-
-## HC1 (Heteroskedasticity-Robust)
-
-Robust to heteroskedasticity using White's (1980) correction:
+## HC1 (Robust)
 
 ```{python}
 #| echo: true
 #| output: true
 
-result_hc1 = leanfe(
-    formula="y ~ treatment + x1 | firm_id + year",
-    data=df,
-    vcov="HC1"
-)
+result_hc1 = leanfe("y ~ treatment + x1 | firm_id + year", data=df, vcov="HC1")
 
-print("HC1 Standard Errors:")
+print("HC1:")
 for var in ["treatment", "x1"]:
-    print(f"  {var}: coef={result_hc1['coefficients'][var]:.4f}, SE={result_hc1['std_errors'][var]:.4f}")
-
-print(f"\nHC1 SE / IID SE ratio:")
-for var in ["treatment", "x1"]:
-    ratio = result_hc1['std_errors'][var] / result_iid['std_errors'][var]
-    print(f"  {var}: {ratio:.2f}x")
+    print(f"  {var}: {result_hc1['coefficients'][var]:.4f} (SE: {result_hc1['std_errors'][var]:.4f})")
 ```
 
-## Clustered Standard Errors
-
-Accounts for correlation within clusters (e.g., firms, states):
+## Clustered
 
 ```{python}
 #| echo: true
 #| output: true
 
 result_cluster = leanfe(
-    formula="y ~ treatment + x1 | firm_id + year",
+    "y ~ treatment + x1 | firm_id + year",
     data=df,
     vcov="cluster",
     cluster_cols=["firm_id"]
 )
 
-print("Clustered Standard Errors (by firm):")
+print("Clustered (firm):")
 for var in ["treatment", "x1"]:
-    print(f"  {var}: coef={result_cluster['coefficients'][var]:.4f}, SE={result_cluster['std_errors'][var]:.4f}")
-print(f"Number of clusters: {result_cluster['n_clusters']}")
-
-print(f"\nCluster SE / IID SE ratio:")
-for var in ["treatment", "x1"]:
-    ratio = result_cluster['std_errors'][var] / result_iid['std_errors'][var]
-    print(f"  {var}: {ratio:.2f}x")
+    print(f"  {var}: {result_cluster['coefficients'][var]:.4f} (SE: {result_cluster['std_errors'][var]:.4f})")
+print(f"Clusters: {result_cluster['n_clusters']}")
 ```
 
-## Multi-Way Clustering
-
-Cluster on multiple dimensions simultaneously:
+## Two-Way Clustering
 
 ```{python}
 #| echo: true
 #| output: true
 
 result_twoway = leanfe(
-    formula="y ~ treatment + x1 | firm_id + year",
+    "y ~ treatment + x1 | firm_id + year",
     data=df,
     vcov="cluster",
     cluster_cols=["firm_id", "year"]
 )
 
-print("Two-Way Clustered Standard Errors (firm + year):")
+print("Two-way (firm + year):")
 for var in ["treatment", "x1"]:
-    print(f"  {var}: coef={result_twoway['coefficients'][var]:.4f}, SE={result_twoway['std_errors'][var]:.4f}")
+    print(f"  {var}: {result_twoway['coefficients'][var]:.4f} (SE: {result_twoway['std_errors'][var]:.4f})")
 ```
 
-## Comparison Summary
+## Comparison
 
 ```{python}
 #| echo: true
 #| output: true
 
-print("Standard Error Comparison for 'treatment':")
-print(f"  IID:        {result_iid['std_errors']['treatment']:.4f}")
-print(f"  HC1:        {result_hc1['std_errors']['treatment']:.4f}")
-print(f"  Clustered:  {result_cluster['std_errors']['treatment']:.4f}")
-print(f"  Two-way:    {result_twoway['std_errors']['treatment']:.4f}")
+print("SE comparison for 'treatment':")
+print(f"  IID:       {result_iid['std_errors']['treatment']:.4f}")
+print(f"  HC1:       {result_hc1['std_errors']['treatment']:.4f}")
+print(f"  Clustered: {result_cluster['std_errors']['treatment']:.4f}")
+print(f"  Two-way:   {result_twoway['std_errors']['treatment']:.4f}")
 ```
-
-## When to Use Each Type
-
-| Data Structure | Recommended SE |
-|----------------|----------------|
-| Cross-section, homoskedastic | IID |
-| Cross-section, heteroskedastic | HC1 |
-| Panel data | Cluster at unit level |
-| DiD with state-level treatment | Cluster at state level |
-| Multi-dimensional correlation | Two-way clustering |
-
-## Rule of Thumb
-
-> **When in doubt, cluster at the level of treatment assignment.**
-
-For panel data, this usually means clustering at the unit level (firm, individual, state).
 
 ## Next Steps
 
-- [Difference-in-Differences](did.qmd) - Clustering for causal inference
-- [Large Datasets](../guides/large-datasets.qmd) - Scale to big data
-- [API Reference](../reference/python.qmd) - Full documentation
+- [DiD & Event Studies](did.qmd)
+- [Large Datasets](../guides/large-datasets.qmd)
+- [API Reference](../reference/python.qmd)
