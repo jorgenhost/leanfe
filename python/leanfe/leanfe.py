@@ -18,8 +18,8 @@ def leanfe(
     fe_cols: Optional[List[str]] = None,
     formula: Optional[str] = None,
     weights: Optional[str] = None,
-    demean_tol: float = 1e-3,
-    n_iter: int = 100,
+    demean_tol: float = 1e-5,
+    max_iter: int = 500,
     vcov: str = "iid",
     cluster_cols: Optional[List[str]] = None,
     ssc: bool = False,
@@ -51,9 +51,9 @@ def leanfe(
         - Instruments (IV): third part after second |
     weights : str, optional
         Column name for regression weights (WLS).
-    demean_tol : float, default 1e-3
+    demean_tol : float, default 1e-5
         Convergence tolerance for iterative demeaning.
-    n_iter : int, default 100
+    max_iter : int, default 500
         Maximum iterations for demeaning.
     vcov : str, default "iid"
         Variance-covariance estimator: "iid", "HC1", or "cluster".
@@ -142,7 +142,7 @@ def leanfe(
             formula=formula,
             weights=weights,
             demean_tol=demean_tol,
-            n_iter=n_iter,
+            max_iter=max_iter,
             vcov=vcov,
             cluster_cols=cluster_cols,
             ssc=ssc,
@@ -157,7 +157,7 @@ def leanfe(
             formula=formula,
             weights=weights,
             demean_tol=demean_tol,
-            n_iter=n_iter,
+            max_iter=max_iter,
             vcov=vcov,
             cluster_cols=cluster_cols,
             ssc=ssc,

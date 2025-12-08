@@ -20,8 +20,8 @@
 #'     \item Instruments (IV): third part after second |
 #'   }
 #' @param weights Column name for regression weights (WLS).
-#' @param demean_tol Convergence tolerance for iterative demeaning (default: 1e-3).
-#' @param n_iter Maximum iterations for demeaning (default: 100).
+#' @param demean_tol Convergence tolerance for iterative demeaning (default: 1e-5).
+#' @param max_iter Maximum iterations for demeaning (default: 500).
 #' @param vcov Variance-covariance estimator: "iid", "HC1", or "cluster" (default: "iid").
 #' @param cluster_cols Character vector of clustering variables (required if vcov="cluster").
 #' @param ssc Logical, small sample correction for clustered SEs (default: FALSE).
@@ -106,8 +106,8 @@ leanfe <- function(
   fe_cols = NULL,
   formula = NULL,
   weights = NULL,
-  demean_tol = 1e-3,
-  n_iter = 100,
+  demean_tol = 1e-5,
+  max_iter = 500,
   vcov = "iid",
   cluster_cols = NULL,
   ssc = FALSE,
@@ -127,7 +127,7 @@ leanfe <- function(
       formula = formula,
       weights = weights,
       demean_tol = demean_tol,
-      n_iter = n_iter,
+      max_iter = max_iter,
       vcov = vcov,
       cluster_cols = cluster_cols,
       ssc = ssc,
@@ -142,7 +142,7 @@ leanfe <- function(
       formula = formula,
       weights = weights,
       demean_tol = demean_tol,
-      n_iter = n_iter,
+      max_iter = max_iter,
       vcov = vcov,
       cluster_cols = cluster_cols,
       ssc = ssc,

@@ -130,8 +130,8 @@ NULL
 #'     \item IV/2SLS: "y ~ x | fe | z" (instruments after second |)
 #'   }
 #' @param weights Column name for regression weights (WLS).
-#' @param demean_tol Convergence tolerance for demeaning (default: 1e-3).
-#' @param n_iter Maximum demeaning iterations (default: 100).
+#' @param demean_tol Convergence tolerance for demeaning (default: 1e-5).
+#' @param max_iter Maximum demeaning iterations (default: 500).
 #' @param vcov Variance estimator: "iid", "HC1", or "cluster" (default: "iid").
 #' @param cluster_cols Character vector of clustering variables (required if vcov="cluster").
 #' @param ssc Logical, small sample correction for clustered SEs (default: FALSE).
@@ -158,8 +158,8 @@ leanfe_polars <- function(
   fe_cols = NULL,
   formula = NULL,
   weights = NULL,
-  demean_tol = 1e-3,
-  n_iter = 100,
+  demean_tol = 1e-5,
+  max_iter = 500,
   vcov = "iid",
   cluster_cols = NULL,
   ssc = FALSE,
@@ -283,7 +283,7 @@ leanfe_polars <- function(
   cols_to_demean <- c(y_col, x_cols, instruments)
   
   # FWL demeaning
-  for (it in 1:n_iter) {
+  for (it in 1:max_iter) {
     for (fe in fe_cols) {
       if (!is.null(weights)) {
         agg_exprs <- lapply(cols_to_demean, function(c) {

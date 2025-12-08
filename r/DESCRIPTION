@@ -15,7 +15,8 @@ Depends:
 Imports:
     polars (>= 0.8.0),
     duckdb (>= 0.9.0),
-    DBI
+    DBI,
+    Matrix
 Suggests:
     testthat (>= 3.0.0)
 RoxygenNote: 7.2.0

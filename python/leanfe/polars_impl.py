@@ -134,8 +134,8 @@ def leanfe_polars(
     fe_cols: Optional[List[str]] = None,
     formula: Optional[str] = None,
     weights: Optional[str] = None,
-    demean_tol: float = 1e-3,
-    n_iter: int = 100,
+    demean_tol: float = 1e-5,
+    max_iter: int = 500,
     vcov: str = "iid",
     cluster_cols: Optional[List[str]] = None,
     ssc: bool = False,
@@ -158,9 +158,9 @@ def leanfe_polars(
         R-style formula: "y ~ x1 + x2 + x:i(factor) | fe1 + fe2 | z1 + z2" (IV)
     weights : str, optional
         Column name for regression weights
-    demean_tol : float, default 1e-3
+    demean_tol : float, default 1e-5
         Convergence tolerance for demeaning
-    n_iter : int, default 100
+    max_iter : int, default 500
         Maximum iterations for demeaning
     vcov : str, default "iid"
         Variance-covariance estimator: "iid", "HC1", or "cluster"
@@ -272,7 +272,7 @@ def leanfe_polars(
     cols_to_demean = [y_col] + x_cols + instruments
     
     # FWL demeaning
-    for it in range(1, n_iter + 1):
+    for it in range(1, max_iter + 1):
         for fe in fe_cols:
             if weights is not None:
                 means = df.group_by(fe).agg([

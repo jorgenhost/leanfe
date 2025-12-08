@@ -7,6 +7,7 @@
 
 #' @importFrom polars pl
 #' @importFrom DBI dbGetQuery
+#' @importFrom Matrix sparseMatrix crossprod
 NULL
 
 
@@ -113,9 +114,10 @@ NULL
 #' @param compressed_df Compressed data frame
 #' @param x_cols Regressors
 #' @param fe_cols Fixed effects
+#' @param use_sparse Use sparse matrices for FE dummies (default TRUE)
 #' @return List with X, Y, wts, all_col_names, n_fe_levels
 #' @keywords internal
-.build_design_matrix <- function(compressed_df, x_cols, fe_cols) {
+.build_design_matrix <- function(compressed_df, x_cols, fe_cols, use_sparse = TRUE) {
   # Convert to data.frame if polars
   if ("polars_data_frame" %in% class(compressed_df)) {
     pdf <- as.data.frame(compressed_df)
@@ -123,69 +125,155 @@ NULL
     pdf <- compressed_df
   }
   
+  n_rows <- nrow(pdf)
+  
   # Extract regressors
   X_reg <- as.matrix(pdf[, x_cols, drop = FALSE])
   Y <- pdf[["_mean_y"]]
   wts <- pdf[["_wts"]]
   
-  # Build FE dummies
-  fe_dummies <- list()
-  fe_col_names <- c()
-  n_fe_levels <- 0
+  if (length(fe_cols) == 0) {
+    return(list(X = X_reg, Y = Y, wts = wts, all_col_names = x_cols, n_fe_levels = 0))
+  }
   
-  for (fe in fe_cols) {
-    categories <- unique(pdf[[fe]])
-    n_cats <- length(categories)
-    n_fe_levels <- n_fe_levels + n_cats
+  if (use_sparse) {
+    # Build sparse FE dummies efficiently using vectorized operations
+    fe_col_names <- c()
+    n_fe_levels <- 0
+    col_offset <- 0
     
-    # Create dummies (drop first category for identification)
-    for (i in seq_along(categories)[-1]) {
-      cat <- categories[i]
-      col_name <- paste0(fe, "_", cat)
-      dummy <- as.numeric(pdf[[fe]] == cat)
-      fe_dummies[[col_name]] <- dummy
-      fe_col_names <- c(fe_col_names, col_name)
+    # Pre-allocate lists for sparse matrix components
+    all_rows <- vector("list", length(fe_cols))
+    all_cols <- vector("list", length(fe_cols))
+    
+    for (idx in seq_along(fe_cols)) {
+      fe <- fe_cols[idx]
+      fe_values <- pdf[[fe]]
+      categories <- sort(unique(fe_values))  # Sort for consistent ordering
+      n_cats <- length(categories)
+      n_fe_levels <- n_fe_levels + n_cats
+      
+      # Drop first category for identification
+      cats_to_use <- categories[-1]
+      
+      # Add column names
+      fe_col_names <- c(fe_col_names, paste0(fe, "_", cats_to_use))
+      
+      # Vectorized: create mapping and find matches
+      # Map each value to its column index (0 if first category)
+      cat_map <- match(fe_values, cats_to_use, nomatch = 0L)
+      
+      # Get rows where we have a match (not first category)
+      valid_mask <- cat_map > 0L
+      all_rows[[idx]] <- which(valid_mask)
+      all_cols[[idx]] <- cat_map[valid_mask] + col_offset
+      
+      col_offset <- col_offset + n_cats - 1  # -1 because we drop first category
     }
-  }
-  
-  # Combine regressors and FE dummies
-  if (length(fe_dummies) > 0) {
-    X_fe <- do.call(cbind, fe_dummies)
-    X <- cbind(X_reg, X_fe)
+    
+    # Combine all sparse entries
+    rows_list <- unlist(all_rows)
+    cols_list <- unlist(all_cols)
+    
+    # Create sparse FE matrix
+    n_fe_cols <- col_offset
+    if (n_fe_cols > 0) {
+      X_fe_sparse <- Matrix::sparseMatrix(
+        i = rows_list,
+        j = cols_list,
+        x = rep(1, length(rows_list)),
+        dims = c(n_rows, n_fe_cols)
+      )
+      
+      # Combine: [X_reg | X_fe] as sparse
+      X_reg_sparse <- Matrix::Matrix(X_reg, sparse = TRUE)
+      X <- cbind(X_reg_sparse, X_fe_sparse)
+    } else {
+      X <- Matrix::Matrix(X_reg, sparse = TRUE)
+    }
+    
     all_col_names <- c(x_cols, fe_col_names)
+    return(list(X = X, Y = Y, wts = wts, all_col_names = all_col_names, n_fe_levels = n_fe_levels))
+    
   } else {
-    X <- X_reg
-    all_col_names <- x_cols
+    # Original dense implementation
+    fe_dummies <- list()
+    fe_col_names <- c()
+    n_fe_levels <- 0
+    
+    for (fe in fe_cols) {
+      categories <- sort(unique(pdf[[fe]]))  # Sort for consistent ordering
+      n_cats <- length(categories)
+      n_fe_levels <- n_fe_levels + n_cats
+      
+      # Create dummies (drop first category for identification)
+      for (cat in categories[-1]) {
+        col_name <- paste0(fe, "_", cat)
+        dummy <- as.numeric(pdf[[fe]] == cat)
+        fe_dummies[[col_name]] <- dummy
+        fe_col_names <- c(fe_col_names, col_name)
+      }
+    }
+    
+    # Combine regressors and FE dummies
+    if (length(fe_dummies) > 0) {
+      X_fe <- do.call(cbind, fe_dummies)
+      X <- cbind(X_reg, X_fe)
+      all_col_names <- c(x_cols, fe_col_names)
+    } else {
+      X <- X_reg
+      all_col_names <- x_cols
+    }
+    
+    list(X = X, Y = Y, wts = wts, all_col_names = all_col_names, n_fe_levels = n_fe_levels)
   }
-  
-  list(X = X, Y = Y, wts = wts, all_col_names = all_col_names, n_fe_levels = n_fe_levels)
 }
 
 
 #' Solve weighted least squares
 #'
-#' @param X Design matrix
+#' @param X Design matrix (dense or sparse)
 #' @param Y Response vector (group means)
 #' @param wts Weights (sqrt(n_g))
 #' @return List with beta and XtX_inv
 #' @keywords internal
 .solve_wls <- function(X, Y, wts) {
-  # Weight the design matrix and response
-  Xw <- X * wts
-  Yw <- Y * wts
+  is_sparse <- inherits(X, "sparseMatrix") || inherits(X, "dgCMatrix")
   
-  # Solve normal equations
-  XtX <- crossprod(Xw)
-  Xty <- crossprod(Xw, Yw)
-  
-  # Use Cholesky if possible
-  XtX_inv <- tryCatch({
-    chol2inv(chol(XtX))
-  }, error = function(e) {
-    solve(XtX)
-  })
-  
-  beta <- XtX_inv %*% Xty
+  if (is_sparse) {
+    # Sparse weighted least squares
+    # Weight the design matrix: diag(wts) @ X
+    Xw <- X * wts  # Matrix package handles this
+    Yw <- Y * wts
+    
+    # X'X - convert to dense for solve (p x p is typically small)
+    XtX <- as.matrix(Matrix::crossprod(Xw))
+    Xty <- as.vector(Matrix::crossprod(Xw, Yw))
+    
+    # Solve using dense methods
+    XtX_inv <- tryCatch({
+      chol2inv(chol(XtX))
+    }, error = function(e) {
+      solve(XtX)
+    })
+    
+    beta <- XtX_inv %*% Xty
+  } else {
+    # Dense weighted least squares
+    Xw <- X * wts
+    Yw <- Y * wts
+    
+    XtX <- crossprod(Xw)
+    Xty <- crossprod(Xw, Yw)
+    
+    XtX_inv <- tryCatch({
+      chol2inv(chol(XtX))
+    }, error = function(e) {
+      solve(XtX)
+    })
+    
+    beta <- XtX_inv %*% Xty
+  }
   
   list(beta = as.vector(beta), XtX_inv = XtX_inv)
 }
@@ -194,7 +282,7 @@ NULL
 #' Compute RSS from sufficient statistics
 #'
 #' @param compressed_df Compressed data
-#' @param X Design matrix
+#' @param X Design matrix (dense or sparse)
 #' @param beta Coefficients
 #' @return List with rss_total and rss_g
 #' @keywords internal
@@ -210,7 +298,7 @@ NULL
   sum_y_g <- pdf[["_sum_y"]]
   sum_y_sq_g <- pdf[["_sum_y_sq"]]
   
-  # Fitted values for each group
+  # Fitted values for each group (handle sparse)
   yhat_g <- as.vector(X %*% beta)
   
   # Per-group RSS
@@ -229,17 +317,24 @@ NULL
 #' @param n_obs Original number of observations
 #' @param df_resid Residual degrees of freedom
 #' @param vcov "iid" or "HC1"
-#' @param X Design matrix
+#' @param X Design matrix (dense or sparse)
 #' @param k_x Number of regressor columns
 #' @return Standard errors for x_cols only
 #' @keywords internal
 .compute_se_compress <- function(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, k_x) {
+  is_sparse <- inherits(X, "sparseMatrix") || inherits(X, "dgCMatrix")
+  
   if (tolower(vcov) == "iid") {
     sigma2 <- rss_total / df_resid
     se_full <- sqrt(diag(XtX_inv) * sigma2)
   } else if (tolower(vcov) == "hc1") {
     # Meat matrix: X' diag(rss_g) X
-    meat <- crossprod(X, X * rss_g)
+    if (is_sparse) {
+      Xw <- X * rss_g
+      meat <- as.matrix(Matrix::crossprod(X, Xw))
+    } else {
+      meat <- crossprod(X, X * rss_g)
+    }
     vcov_matrix <- XtX_inv %*% meat %*% XtX_inv
     # HC1 adjustment
     adjustment <- n_obs / df_resid
@@ -295,7 +390,7 @@ NULL
   se <- .compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols))
   
   # Extract coefficients for x_cols only
-  beta_x <- beta[1:length(x_cols)]
+  beta_x <- beta[seq_along(x_cols)]
   
   list(
     coefficients = setNames(beta_x, x_cols),
@@ -353,7 +448,7 @@ NULL
   se <- .compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols))
   
   # Extract coefficients for x_cols only
-  beta_x <- beta[1:length(x_cols)]
+  beta_x <- beta[seq_along(x_cols)]
   
   list(
     coefficients = setNames(beta_x, x_cols),

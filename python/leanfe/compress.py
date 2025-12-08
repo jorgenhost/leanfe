@@ -13,6 +13,8 @@ Used automatically when vcov is "iid" or "HC1" (not cluster) and no IV.
 
 import numpy as np
 import polars as pl
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
 from typing import List, Optional, Dict, Tuple
 
 
@@ -158,11 +160,34 @@ def compress_duckdb(
     return compressed_df, n_obs_original
 
 
+def _extract_numpy_arrays(compressed_df, x_cols: List[str], backend: str):
+    """Extract numpy arrays from compressed dataframe without pandas dependency."""
+    if backend == "polars":
+        # Use Polars native to_numpy() - no pandas needed
+        X_reg = np.column_stack([compressed_df[col].to_numpy() for col in x_cols])
+        Y = compressed_df["_mean_y"].to_numpy()
+        wts = compressed_df["_wts"].to_numpy()
+        
+        def get_fe_values(fe):
+            return compressed_df[fe].to_numpy()
+    else:
+        # DuckDB returns pandas DataFrame
+        X_reg = compressed_df[x_cols].values
+        Y = compressed_df["_mean_y"].values
+        wts = compressed_df["_wts"].values
+        
+        def get_fe_values(fe):
+            return compressed_df[fe].values
+    
+    return X_reg, Y, wts, get_fe_values
+
+
 def build_design_matrix(
     compressed_df,
     x_cols: List[str],
     fe_cols: List[str],
-    backend: str = "polars"
+    backend: str = "polars",
+    use_sparse: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], int]:
     """
     Build design matrix from compressed data with FE dummies.
@@ -177,57 +202,105 @@ def build_design_matrix(
         Fixed effect columns
     backend : str
         "polars" or "duckdb"
+    use_sparse : bool
+        If True, use sparse matrices for FE dummies (much faster)
         
     Returns
     -------
     tuple
         (X, Y, wts, all_col_names, n_fe_levels)
+        X is sparse.csr_matrix if use_sparse=True and fe_cols exist
     """
-    if backend == "polars":
-        # Convert to pandas for easier manipulation
-        pdf = compressed_df.to_pandas()
-    else:
-        pdf = compressed_df
+    # Extract numpy arrays without pandas dependency
+    X_reg, Y, wts, get_fe_values = _extract_numpy_arrays(compressed_df, x_cols, backend)
+    n_rows = len(Y)
     
-    # Extract regressors
-    X_reg = pdf[x_cols].values
-    Y = pdf["_mean_y"].values
-    wts = pdf["_wts"].values
+    if not fe_cols:
+        return X_reg, Y, wts, list(x_cols), 0
     
-    # Build FE dummies using sparse matrix
-    fe_dummies = []
-    fe_col_names = []
-    n_fe_levels = 0
-    
-    for fe in fe_cols:
-        categories = pdf[fe].unique()
-        n_cats = len(categories)
-        n_fe_levels += n_cats
+    if use_sparse:
+        # Build sparse FE dummies efficiently using COO format
+        fe_col_names = []
+        n_fe_levels = 0
+        col_offset = 0
         
-        # Create mapping
-        cat_to_idx = {cat: i for i, cat in enumerate(categories)}
+        # Collect sparse matrix components
+        rows_list = []
+        cols_list = []
+        data_list = []
         
-        # Create dummy matrix (drop first category for identification)
-        for i, cat in enumerate(categories[1:], 1):
-            col_name = f"{fe}_{cat}"
-            dummy = (pdf[fe] == cat).astype(float).values
-            fe_dummies.append(dummy)
-            fe_col_names.append(col_name)
-    
-    # Combine regressors and FE dummies
-    if fe_dummies:
-        X_fe = np.column_stack(fe_dummies)
-        X = np.hstack([X_reg, X_fe])
+        for fe in fe_cols:
+            fe_values = get_fe_values(fe)
+            categories = np.unique(fe_values)
+            n_cats = len(categories)
+            n_fe_levels += n_cats
+            
+            # Create mapping from category to column index (drop first for identification)
+            cat_to_col = {cat: i + col_offset for i, cat in enumerate(categories[1:])}
+            
+            # Add column names
+            for cat in categories[1:]:
+                fe_col_names.append(f"{fe}_{cat}")
+            
+            # Build sparse entries for this FE
+            for row_idx, val in enumerate(fe_values):
+                if val in cat_to_col:
+                    rows_list.append(row_idx)
+                    cols_list.append(cat_to_col[val])
+                    data_list.append(1.0)
+            
+            col_offset += n_cats - 1  # -1 because we drop first category
+        
+        # Create sparse FE matrix
+        n_fe_cols = col_offset
+        if n_fe_cols > 0:
+            X_fe_sparse = sparse.coo_matrix(
+                (data_list, (rows_list, cols_list)),
+                shape=(n_rows, n_fe_cols)
+            ).tocsr()
+            
+            # Combine: [X_reg | X_fe] as sparse
+            X_reg_sparse = sparse.csr_matrix(X_reg)
+            X = sparse.hstack([X_reg_sparse, X_fe_sparse], format='csr')
+        else:
+            X = sparse.csr_matrix(X_reg)
+        
         all_col_names = list(x_cols) + fe_col_names
-    else:
-        X = X_reg
-        all_col_names = list(x_cols)
+        return X, Y, wts, all_col_names, n_fe_levels
     
-    return X, Y, wts, all_col_names, n_fe_levels
+    else:
+        # Original dense implementation
+        fe_dummies = []
+        fe_col_names = []
+        n_fe_levels = 0
+        
+        for fe in fe_cols:
+            fe_values = get_fe_values(fe)
+            categories = np.unique(fe_values)
+            n_cats = len(categories)
+            n_fe_levels += n_cats
+            
+            # Create dummy matrix (drop first category for identification)
+            for cat in categories[1:]:
+                col_name = f"{fe}_{cat}"
+                dummy = (fe_values == cat).astype(float)
+                fe_dummies.append(dummy)
+                fe_col_names.append(col_name)
+        
+        # Combine regressors and FE dummies
+        if fe_dummies:
+            X_fe = np.column_stack(fe_dummies)
+            X = np.hstack([X_reg, X_fe])
+            all_col_names = list(x_cols) + fe_col_names
+        else:
+            X = X_reg
+            all_col_names = list(x_cols)
+        
+        return X, Y, wts, all_col_names, n_fe_levels
 
 
 def solve_wls(
-    X: np.ndarray,
+    X,  # np.ndarray or sparse matrix
     Y: np.ndarray,
     wts: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -236,7 +309,7 @@ def solve_wls(
     
     Parameters
     ----------
-    X : np.ndarray
+    X : np.ndarray or scipy.sparse matrix
         Design matrix (G x p)
     Y : np.ndarray
         Response vector (G,) - group means
@@ -248,30 +321,48 @@ def solve_wls(
     tuple
         (beta, XtX_inv)
     """
-    # Weight the design matrix and response
-    Xw = X * wts[:, np.newaxis]
-    Yw = Y * wts
+    is_sparse = sparse.issparse(X)
     
-    # Solve normal equations
-    XtX = Xw.T @ Xw
-    Xty = Xw.T @ Yw
-    
-    # Use Cholesky if possible, fallback to QR
-    try:
-        L = np.linalg.cholesky(XtX)
-        beta = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
-        XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(XtX.shape[0])))
-    except np.linalg.LinAlgError:
-        # Fallback to QR
-        beta, _, _, _ = np.linalg.lstsq(XtX, Xty, rcond=None)
-        XtX_inv = np.linalg.pinv(XtX)
+    if is_sparse:
+        # Sparse weighted least squares
+        # Weight the design matrix: diag(wts) @ X
+        Xw = X.multiply(wts[:, np.newaxis])
+        Yw = Y * wts
+        
+        # X'X is dense (p x p is typically small)
+        XtX = (Xw.T @ Xw).toarray()
+        Xty = Xw.T @ Yw
+        
+        # Solve using dense methods (XtX is small)
+        try:
+            L = np.linalg.cholesky(XtX)
+            beta = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(XtX.shape[0])))
+        except np.linalg.LinAlgError:
+            beta, _, _, _ = np.linalg.lstsq(XtX, Xty, rcond=None)
+            XtX_inv = np.linalg.pinv(XtX)
+    else:
+        # Dense weighted least squares
+        Xw = X * wts[:, np.newaxis]
+        Yw = Y * wts
+        
+        XtX = Xw.T @ Xw
+        Xty = Xw.T @ Yw
+        
+        try:
+            L = np.linalg.cholesky(XtX)
+            beta = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(XtX.shape[0])))
+        except np.linalg.LinAlgError:
+            beta, _, _, _ = np.linalg.lstsq(XtX, Xty, rcond=None)
+            XtX_inv = np.linalg.pinv(XtX)
     
     return beta, XtX_inv
 
 
 def compute_rss_grouped(
     compressed_df,
-    X: np.ndarray,
+    X,  # np.ndarray or sparse matrix
     beta: np.ndarray,
     backend: str = "polars"
 ) -> Tuple[float, np.ndarray]:
@@ -284,7 +375,7 @@ def compute_rss_grouped(
     ----------
     compressed_df : DataFrame
         Compressed data with _n, _sum_y, _sum_y_sq
-    X : np.ndarray
+    X : np.ndarray or scipy.sparse matrix
         Design matrix
     beta : np.ndarray
         Coefficient vector
@@ -305,8 +396,11 @@ def compute_rss_grouped(
         sum_y_g = compressed_df["_sum_y"].values
         sum_y_sq_g = compressed_df["_sum_y_sq"].values
     
-    # Fitted values for each group
-    yhat_g = X @ beta
+    # Fitted values for each group (handle sparse)
+    if sparse.issparse(X):
+        yhat_g = np.asarray(X @ beta).flatten()
+    else:
+        yhat_g = X @ beta
     
     # Per-group RSS
     rss_g = sum_y_sq_g - 2 * yhat_g * sum_y_g + n_g * (yhat_g ** 2)
@@ -322,7 +416,7 @@ def compute_se_compress(
     n_obs: int,
     df_resid: int,
     vcov: str,
-    X: np.ndarray,
+    X,  # np.ndarray or sparse matrix
     x_cols: List[str]
 ) -> np.ndarray:
     """
@@ -342,7 +436,7 @@ def compute_se_compress(
         Residual degrees of freedom
     vcov : str
         "iid" or "HC1"
-    X : np.ndarray
+    X : np.ndarray or scipy.sparse matrix
         Design matrix (compressed)
     x_cols : list of str
         Names of regressor columns (to extract subset of SEs)
@@ -359,7 +453,12 @@ def compute_se_compress(
         se_full = np.sqrt(np.diag(XtX_inv) * sigma2)
     elif vcov.upper() == "HC1":
         # Meat matrix: X' diag(rss_g) X
-        meat = X.T @ (X * rss_g[:, np.newaxis])
+        if sparse.issparse(X):
+            # Sparse: X.T @ diag(rss_g) @ X
+            Xw = X.multiply(rss_g[:, np.newaxis])
+            meat = (X.T @ Xw).toarray()
+        else:
+            meat = X.T @ (X * rss_g[:, np.newaxis])
         vcov_matrix = XtX_inv @ meat @ XtX_inv
         # HC1 adjustment
         adjustment = n_obs / df_resid
