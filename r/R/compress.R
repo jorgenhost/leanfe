@@ -18,22 +18,31 @@ NULL
 #' @return Logical
 #' @keywords internal
 .should_use_compress <- function(vcov, has_instruments) {
-  vcov_ok <- tolower(vcov) %in% c("iid", "hc1")
+  vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
   return(vcov_ok && !has_instruments)
 }
 
 
 #' Compress data using Polars GROUP BY
 #'
+#' For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+#' in the grouping to ensure each compressed record belongs to one cluster.
+#'
 #' @param df Polars DataFrame
 #' @param y_col Dependent variable
 #' @param x_cols Regressors
 #' @param fe_cols Fixed effects
 #' @param weights Weight column (optional)
+#' @param cluster_col Cluster column for within-cluster compression (optional)
 #' @return List with compressed df and n_obs_original
 #' @keywords internal
-.compress_polars <- function(df, y_col, x_cols, fe_cols, weights = NULL) {
+.compress_polars <- function(df, y_col, x_cols, fe_cols, weights = NULL, cluster_col = NULL) {
   group_cols <- c(x_cols, fe_cols)
+  # For cluster SEs, add cluster to grouping (Section 5.3.1)
+  if (!is.null(cluster_col) && !(cluster_col %in% group_cols)) {
+    group_cols <- c(group_cols, cluster_col)
+  }
+  
   n_obs_original <- df$height
   
   if (!is.null(weights)) {
@@ -64,15 +73,23 @@ NULL
 
 #' Compress data using DuckDB SQL
 #'
+#' For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+#' in the grouping to ensure each compressed record belongs to one cluster.
+#'
 #' @param con DuckDB connection
 #' @param y_col Dependent variable
 #' @param x_cols Regressors
 #' @param fe_cols Fixed effects
 #' @param weights Weight column (optional)
+#' @param cluster_col Cluster column for within-cluster compression (optional)
 #' @return List with compressed df and n_obs_original
 #' @keywords internal
-.compress_duckdb <- function(con, y_col, x_cols, fe_cols, weights = NULL) {
+.compress_duckdb <- function(con, y_col, x_cols, fe_cols, weights = NULL, cluster_col = NULL) {
   group_cols <- c(x_cols, fe_cols)
+  # For cluster SEs, add cluster to grouping (Section 5.3.1)
+  if (!is.null(cluster_col) && !(cluster_col %in% group_cols)) {
+    group_cols <- c(group_cols, cluster_col)
+  }
   group_cols_sql <- paste(group_cols, collapse = ", ")
   
   n_obs_original <- dbGetQuery(con, "SELECT COUNT(*) FROM data")[[1]]
@@ -309,24 +326,61 @@ NULL
 }
 
 
+#' Build sparse cluster indicator matrix
+#'
+#' W_C in R^{G x C} where entry (g, c) = 1 if group g belongs to cluster c.
+#' Implements Section 5.3.1 of YOCO paper.
+#'
+#' @param cluster_ids Cluster ID for each compressed group (length G)
+#' @return List with W_C sparse matrix and n_clusters
+#' @keywords internal
+.build_sparse_cluster_matrix <- function(cluster_ids) {
+  unique_clusters <- unique(cluster_ids)
+  n_clusters <- length(unique_clusters)
+  n_groups <- length(cluster_ids)
+  
+  # Map cluster IDs to column indices
+  cluster_map <- match(cluster_ids, unique_clusters)
+  
+  # Build sparse matrix: row=group_idx, col=cluster_idx, data=1
+  W_C <- Matrix::sparseMatrix(
+    i = seq_len(n_groups),
+    j = cluster_map,
+    x = rep(1, n_groups),
+    dims = c(n_groups, n_clusters)
+  )
+  
+  list(W_C = W_C, n_clusters = n_clusters)
+}
+
+
 #' Compute standard errors from compressed data
+#'
+#' For cluster SEs, implements Section 5.3.1 of YOCO paper using sparse matrices:
+#' Xi_hat = M_tilde' diag(e0_tilde) W_C W_C' diag(e0_tilde) M_tilde
 #'
 #' @param XtX_inv Inverse of X'X
 #' @param rss_total Total RSS
 #' @param rss_g Per-group RSS
 #' @param n_obs Original number of observations
 #' @param df_resid Residual degrees of freedom
-#' @param vcov "iid" or "HC1"
+#' @param vcov "iid", "HC1", or "cluster"
 #' @param X Design matrix (dense or sparse)
 #' @param k_x Number of regressor columns
-#' @return Standard errors for x_cols only
+#' @param cluster_ids Cluster ID for each compressed group (required for cluster SEs)
+#' @param e0_g Sum of residuals per group (required for cluster SEs)
+#' @param ssc Small sample correction for cluster SEs
+#' @return List with se (standard errors for x_cols only) and n_clusters
 #' @keywords internal
-.compute_se_compress <- function(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, k_x) {
+.compute_se_compress <- function(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, k_x,
+                                  cluster_ids = NULL, e0_g = NULL, ssc = FALSE) {
   is_sparse <- inherits(X, "sparseMatrix") || inherits(X, "dgCMatrix")
+  n_clusters <- NULL
   
   if (tolower(vcov) == "iid") {
     sigma2 <- rss_total / df_resid
     se_full <- sqrt(diag(XtX_inv) * sigma2)
+    
   } else if (tolower(vcov) == "hc1") {
     # Meat matrix: X' diag(rss_g) X
     if (is_sparse) {
@@ -339,28 +393,75 @@ NULL
     # HC1 adjustment
     adjustment <- n_obs / df_resid
     se_full <- sqrt(diag(vcov_matrix) * adjustment)
+    
+  } else if (tolower(vcov) == "cluster") {
+    if (is.null(cluster_ids) || is.null(e0_g)) {
+      stop("cluster_ids and e0_g required for cluster SEs")
+    }
+    
+    # Section 5.3.1: Xi_hat = M_tilde' diag(e0_tilde) W_C W_C' diag(e0_tilde) M_tilde
+    # Using sparse cluster matrix for efficient aggregation
+    
+    # Build sparse cluster indicator matrix W_C
+    cluster_result <- .build_sparse_cluster_matrix(cluster_ids)
+    W_C <- cluster_result$W_C
+    n_clusters <- cluster_result$n_clusters
+    
+    # Compute scores per group: diag(e0_tilde) @ M_tilde = X * e0_g
+    if (is_sparse) {
+      scores_g <- X * e0_g  # G x p sparse
+    } else {
+      scores_g <- Matrix::Matrix(X * e0_g, sparse = TRUE)  # G x p sparse
+    }
+    
+    # Aggregate scores within clusters using sparse matrix multiplication:
+    # cluster_scores = W_C' @ scores_g  (C x p)
+    cluster_scores <- Matrix::crossprod(W_C, scores_g)  # C x p
+    
+    # Meat matrix: cluster_scores' @ cluster_scores = sum_c (s_c @ s_c')
+    meat <- as.matrix(Matrix::crossprod(cluster_scores))
+    
+    # Small sample correction
+    if (ssc) {
+      adjustment <- (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
+    } else {
+      adjustment <- n_clusters / (n_clusters - 1)
+    }
+    
+    vcov_matrix <- adjustment * XtX_inv %*% meat %*% XtX_inv
+    se_full <- sqrt(diag(vcov_matrix))
+    
   } else {
-    stop(sprintf("vcov must be 'iid' or 'HC1' for compress strategy, got '%s'", vcov))
+    stop(sprintf("vcov must be 'iid', 'HC1', or 'cluster', got '%s'", vcov))
   }
   
   # Return only SEs for x_cols (not FE dummies)
-  se_full[1:k_x]
+  list(se = se_full[1:k_x], n_clusters = n_clusters)
 }
 
 
 #' Run compressed regression using Polars backend
+#'
+#' For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression)
+#' using sparse matrices for efficient cluster score aggregation.
 #'
 #' @param df Polars DataFrame
 #' @param y_col Dependent variable
 #' @param x_cols Regressors
 #' @param fe_cols Fixed effects
 #' @param weights Weight column (optional)
-#' @param vcov "iid" or "HC1"
+#' @param vcov "iid", "HC1", or "cluster"
+#' @param cluster_col Cluster column (required if vcov="cluster")
+#' @param ssc Small sample correction for cluster SEs
 #' @return Regression results list
 #' @keywords internal
-.leanfe_compress_polars <- function(df, y_col, x_cols, fe_cols, weights = NULL, vcov = "iid") {
-  # Compress data
-  comp_result <- .compress_polars(df, y_col, x_cols, fe_cols, weights)
+.leanfe_compress_polars <- function(df, y_col, x_cols, fe_cols, weights = NULL, vcov = "iid",
+                                     cluster_col = NULL, ssc = FALSE) {
+  # Compress data (include cluster in grouping for cluster SEs)
+  comp_result <- .compress_polars(
+    df, y_col, x_cols, fe_cols, weights,
+    cluster_col = if (tolower(vcov) == "cluster") cluster_col else NULL
+  )
   compressed <- comp_result$compressed
   n_obs <- comp_result$n_obs_original
   n_compressed <- compressed$height
@@ -386,8 +487,25 @@ NULL
   p <- length(all_cols)
   df_resid <- n_obs - p
   
+  # For cluster SEs, compute e0_g = sum_y - n * yhat (sum of residuals per group)
+  cluster_ids <- NULL
+  e0_g <- NULL
+  if (tolower(vcov) == "cluster" && !is.null(cluster_col)) {
+    pdf <- as.data.frame(compressed)
+    cluster_ids <- pdf[[cluster_col]]
+    n_g <- pdf[["_n"]]
+    sum_y_g <- pdf[["_sum_y"]]
+    yhat_g <- as.vector(X %*% beta)
+    e0_g <- sum_y_g - n_g * yhat_g  # e0_tilde = y0_tilde - n_tilde * yhat
+  }
+  
   # Standard errors
-  se <- .compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols))
+  se_result <- .compute_se_compress(
+    XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols),
+    cluster_ids = cluster_ids, e0_g = e0_g, ssc = ssc
+  )
+  se <- se_result$se
+  n_clusters <- se_result$n_clusters
   
   # Extract coefficients for x_cols only
   beta_x <- beta[seq_along(x_cols)]
@@ -401,24 +519,34 @@ NULL
     vcov_type = vcov,
     strategy = "compress",
     df_resid = df_resid,
-    rss = rss_total
+    rss = rss_total,
+    n_clusters = n_clusters
   )
 }
 
 
 #' Run compressed regression using DuckDB backend
 #'
+#' For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression)
+#' using sparse matrices for efficient cluster score aggregation.
+#'
 #' @param con DuckDB connection
 #' @param y_col Dependent variable
 #' @param x_cols Regressors
 #' @param fe_cols Fixed effects
 #' @param weights Weight column (optional)
-#' @param vcov "iid" or "HC1"
+#' @param vcov "iid", "HC1", or "cluster"
+#' @param cluster_col Cluster column (required if vcov="cluster")
+#' @param ssc Small sample correction for cluster SEs
 #' @return Regression results list
 #' @keywords internal
-.leanfe_compress_duckdb <- function(con, y_col, x_cols, fe_cols, weights = NULL, vcov = "iid") {
-  # Compress data
-  comp_result <- .compress_duckdb(con, y_col, x_cols, fe_cols, weights)
+.leanfe_compress_duckdb <- function(con, y_col, x_cols, fe_cols, weights = NULL, vcov = "iid",
+                                     cluster_col = NULL, ssc = FALSE) {
+  # Compress data (include cluster in grouping for cluster SEs)
+  comp_result <- .compress_duckdb(
+    con, y_col, x_cols, fe_cols, weights,
+    cluster_col = if (tolower(vcov) == "cluster") cluster_col else NULL
+  )
   compressed <- comp_result$compressed
   n_obs <- comp_result$n_obs_original
   n_compressed <- nrow(compressed)
@@ -444,8 +572,24 @@ NULL
   p <- length(all_cols)
   df_resid <- n_obs - p
   
+  # For cluster SEs, compute e0_g = sum_y - n * yhat (sum of residuals per group)
+  cluster_ids <- NULL
+  e0_g <- NULL
+  if (tolower(vcov) == "cluster" && !is.null(cluster_col)) {
+    cluster_ids <- compressed[[cluster_col]]
+    n_g <- compressed[["_n"]]
+    sum_y_g <- compressed[["_sum_y"]]
+    yhat_g <- as.vector(X %*% beta)
+    e0_g <- sum_y_g - n_g * yhat_g  # e0_tilde = y0_tilde - n_tilde * yhat
+  }
+  
   # Standard errors
-  se <- .compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols))
+  se_result <- .compute_se_compress(
+    XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, length(x_cols),
+    cluster_ids = cluster_ids, e0_g = e0_g, ssc = ssc
+  )
+  se <- se_result$se
+  n_clusters <- se_result$n_clusters
   
   # Extract coefficients for x_cols only
   beta_x <- beta[seq_along(x_cols)]
@@ -459,6 +603,7 @@ NULL
     vcov_type = vcov,
     strategy = "compress",
     df_resid = df_resid,
-    rss = rss_total
+    rss = rss_total,
+    n_clusters = n_clusters
   )
 }

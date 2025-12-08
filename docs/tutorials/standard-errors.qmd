@@ -7,13 +7,15 @@ subtitle: "IID, HC1, and clustered"
 
 This tutorial shows the standard error options available in `leanfe`.
 
+All standard error types use **YOCO compression** from [Wong et al. (2021)](https://arxiv.org/abs/2102.11297) for blazing fast computation. For clustered SEs, leanfe implements Section 5.3.1 using **sparse matrices** for efficient cluster score aggregation.
+
 ## Options
 
-| Type | Syntax | Description |
-|------|--------|-------------|
-| IID | `vcov="iid"` | Homoskedastic errors |
-| HC1 | `vcov="HC1"` | Heteroskedasticity-robust |
-| Clustered | `vcov="cluster"` | Correlation within groups |
+| Type | Syntax | Description | YOCO Support |
+|------|--------|-------------|--------------|
+| IID | `vcov="iid"` | Homoskedastic errors | ✅ |
+| HC1 | `vcov="HC1"` | Heteroskedasticity-robust | ✅ |
+| Clustered | `vcov="cluster"` | Correlation within groups | ✅ (sparse matrix) |
 
 ## Example Data
 
@@ -73,6 +75,12 @@ for var in ["treatment", "x1"]:
 
 ## Clustered
 
+Clustered SEs use **YOCO + sparse matrix** (Section 5.3.1 of Wong et al. 2021) for efficient computation:
+
+1. Within-cluster compression: cluster ID added to GROUP BY
+2. Sparse cluster matrix W̃_C for vectorized score aggregation
+3. No loops over clusters - pure matrix operations
+
 ```{python}
 #| echo: true
 #| output: true
@@ -88,6 +96,7 @@ print("Clustered (firm):")
 for var in ["treatment", "x1"]:
     print(f"  {var}: {result_cluster['coefficients'][var]:.4f} (SE: {result_cluster['std_errors'][var]:.4f})")
 print(f"Clusters: {result_cluster['n_clusters']}")
+print(f"Strategy: {result_cluster.get('strategy', 'N/A')}")
 ```
 
 ## Two-Way Clustering

@@ -23,7 +23,7 @@ def should_use_compress(vcov: str, has_instruments: bool) -> bool:
     Determine if compression strategy should be used.
     
     Compression is used when:
-    - vcov is "iid" or "HC1" (cluster requires different handling)
+    - vcov is "iid", "HC1", or "cluster" (all supported with YOCO)
     - No instrumental variables
     
     Parameters
@@ -38,7 +38,7 @@ def should_use_compress(vcov: str, has_instruments: bool) -> bool:
     bool
         True if compression should be used
     """
-    vcov_ok = vcov.lower() in ("iid", "hc1")
+    vcov_ok = vcov.lower() in ("iid", "hc1", "cluster")
     return vcov_ok and not has_instruments
 
 
@@ -47,10 +47,14 @@ def compress_polars(
     y_col: str,
     x_cols: List[str],
     fe_cols: List[str],
-    weights: Optional[str] = None
+    weights: Optional[str] = None,
+    cluster_col: Optional[str] = None
 ) -> Tuple[pl.DataFrame, int]:
     """
     Compress data using GROUP BY on regressors + fixed effects.
+    
+    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+    in the grouping to ensure each compressed record belongs to one cluster.
     
     Parameters
     ----------
@@ -64,6 +68,8 @@ def compress_polars(
         Fixed effect columns
     weights : str, optional
         Weight column name
+    cluster_col : str, optional
+        Cluster column for within-cluster compression
         
     Returns
     -------
@@ -71,6 +77,10 @@ def compress_polars(
         (compressed_df, n_obs_original)
     """
     group_cols = x_cols + fe_cols
+    # For cluster SEs, add cluster to grouping (Section 5.3.1)
+    if cluster_col is not None and cluster_col not in group_cols:
+        group_cols = group_cols + [cluster_col]
+    
     n_obs_original = len(df)
     
     if weights is not None:
@@ -116,10 +126,14 @@ def compress_duckdb(
     y_col: str,
     x_cols: List[str],
     fe_cols: List[str],
-    weights: Optional[str] = None
+    weights: Optional[str] = None,
+    cluster_col: Optional[str] = None
 ) -> Tuple[DuckDBResult, int]:
     """
     Compress data using SQL GROUP BY.
+    
+    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+    in the grouping to ensure each compressed record belongs to one cluster.
     
     Parameters
     ----------
@@ -133,6 +147,8 @@ def compress_duckdb(
         Fixed effect columns
     weights : str, optional
         Weight column name
+    cluster_col : str, optional
+        Cluster column for within-cluster compression
         
     Returns
     -------
@@ -140,6 +156,10 @@ def compress_duckdb(
         (compressed_data as DuckDBResult, n_obs_original)
     """
     group_cols = x_cols + fe_cols
+    # For cluster SEs, add cluster to grouping (Section 5.3.1)
+    if cluster_col is not None and cluster_col not in group_cols:
+        group_cols = group_cols + [cluster_col]
+    
     group_cols_sql = ", ".join(group_cols)
     
     n_obs_original = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
@@ -425,6 +445,34 @@ def compute_rss_grouped(
     return rss_total, rss_g
 
 
+def _build_sparse_cluster_matrix(cluster_ids: np.ndarray) -> Tuple[sparse.csr_matrix, int]:
+    """
+    Build sparse cluster indicator matrix W̃_C from Section 5.3.1.
+    
+    W̃_C ∈ R^{G×C} where entry (g, c) = 1 if group g belongs to cluster c.
+    
+    Parameters
+    ----------
+    cluster_ids : np.ndarray
+        Cluster ID for each compressed group (length G)
+        
+    Returns
+    -------
+    tuple
+        (W_C sparse matrix, n_clusters)
+    """
+    unique_clusters, inverse = np.unique(cluster_ids, return_inverse=True)
+    n_clusters = len(unique_clusters)
+    n_groups = len(cluster_ids)
+    
+    # Build sparse matrix in COO format: row=group_idx, col=cluster_idx, data=1
+    W_C = sparse.csr_matrix(
+        (np.ones(n_groups), (np.arange(n_groups), inverse)),
+        shape=(n_groups, n_clusters)
+    )
+    return W_C, n_clusters
+
+
 def compute_se_compress(
     XtX_inv: np.ndarray,
     rss_total: float,
@@ -433,10 +481,19 @@ def compute_se_compress(
     df_resid: int,
     vcov: str,
     X,  # np.ndarray or sparse matrix
-    x_cols: List[str]
-) -> np.ndarray:
+    x_cols: List[str],
+    cluster_ids: Optional[np.ndarray] = None,
+    e0_g: Optional[np.ndarray] = None,
+    ssc: bool = False
+) -> Tuple[np.ndarray, Optional[int]]:
     """
     Compute standard errors from compressed data.
+    
+    For cluster SEs, implements Section 5.3.1 of YOCO paper using sparse matrices:
+    Ξ̂ = M̃ᵀ diag(ẽ⁰) W̃_C W̃_Cᵀ diag(ẽ⁰) M̃
+    
+    The sparse cluster matrix W̃_C efficiently aggregates scores within clusters,
+    avoiding explicit loops and enabling vectorized computation.
     
     Parameters
     ----------
@@ -451,26 +508,33 @@ def compute_se_compress(
     df_resid : int
         Residual degrees of freedom
     vcov : str
-        "iid" or "HC1"
+        "iid", "HC1", or "cluster"
     X : np.ndarray or scipy.sparse matrix
         Design matrix (compressed)
     x_cols : list of str
         Names of regressor columns (to extract subset of SEs)
+    cluster_ids : np.ndarray, optional
+        Cluster ID for each compressed group (required for cluster SEs)
+    e0_g : np.ndarray, optional
+        Sum of residuals per group: ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ (required for cluster SEs)
+    ssc : bool
+        Small sample correction for cluster SEs
         
     Returns
     -------
-    np.ndarray
-        Standard errors for x_cols only
+    tuple
+        (se for x_cols only, n_clusters or None)
     """
     k_x = len(x_cols)
+    n_clusters = None
     
     if vcov == "iid":
         sigma2 = rss_total / df_resid
         se_full = np.sqrt(np.diag(XtX_inv) * sigma2)
+        
     elif vcov.upper() == "HC1":
         # Meat matrix: X' diag(rss_g) X
         if sparse.issparse(X):
-            # Sparse: X.T @ diag(rss_g) @ X
             Xw = X.multiply(rss_g[:, np.newaxis])
             meat = (X.T @ Xw).toarray()
         else:
@@ -478,12 +542,51 @@ def compute_se_compress(
         vcov_matrix = XtX_inv @ meat @ XtX_inv
         # HC1 adjustment
         adjustment = n_obs / df_resid
-        se_full = np.sqrt(np.diag(vcov_matrix) * adjustment)
+        # Use np.maximum to handle numerical precision issues (tiny negative values)
+        se_full = np.sqrt(np.maximum(np.diag(vcov_matrix) * adjustment, 0.0))
+        
+    elif vcov.lower() == "cluster":
+        if cluster_ids is None or e0_g is None:
+            raise ValueError("cluster_ids and e0_g required for cluster SEs")
+        
+        # Section 5.3.1: Ξ̂ = M̃ᵀ diag(ẽ⁰) W̃_C W̃_Cᵀ diag(ẽ⁰) M̃
+        # Using sparse cluster matrix for efficient aggregation
+        
+        # Build sparse cluster indicator matrix W̃_C
+        W_C, n_clusters = _build_sparse_cluster_matrix(cluster_ids)
+        
+        # Compute scores per group: diag(ẽ⁰) @ M̃ = X * e0_g[:, None]
+        if sparse.issparse(X):
+            # X is sparse: multiply each row by corresponding e0_g
+            scores_g = X.multiply(e0_g[:, np.newaxis])  # G x p sparse
+        else:
+            scores_g = sparse.csr_matrix(X * e0_g[:, np.newaxis])  # G x p sparse
+        
+        # Aggregate scores within clusters using sparse matrix multiplication:
+        # cluster_scores = W̃_Cᵀ @ scores_g  (C x p)
+        # This is equivalent to summing scores_g rows within each cluster
+        cluster_scores = W_C.T @ scores_g  # C x p
+        
+        # Meat matrix: cluster_scoresᵀ @ cluster_scores = Σ_c (s_c @ s_c')
+        if sparse.issparse(cluster_scores):
+            meat = (cluster_scores.T @ cluster_scores).toarray()
+        else:
+            meat = cluster_scores.T @ cluster_scores
+        
+        # Small sample correction
+        if ssc:
+            adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
+        else:
+            adjustment = n_clusters / (n_clusters - 1)
+        
+        vcov_matrix = adjustment * XtX_inv @ meat @ XtX_inv
+        se_full = np.sqrt(np.diag(vcov_matrix))
+        
     else:
-        raise ValueError(f"vcov must be 'iid' or 'HC1' for compress strategy, got '{vcov}'")
+        raise ValueError(f"vcov must be 'iid', 'HC1', or 'cluster', got '{vcov}'")
     
     # Return only SEs for x_cols (not FE dummies)
-    return se_full[:k_x]
+    return se_full[:k_x], n_clusters
 
 
 def leanfe_compress_polars(
@@ -492,10 +595,14 @@ def leanfe_compress_polars(
     x_cols: List[str],
     fe_cols: List[str],
     weights: Optional[str] = None,
-    vcov: str = "iid"
+    vcov: str = "iid",
+    cluster_col: Optional[str] = None,
+    ssc: bool = False
 ) -> Dict:
     """
     Run compressed regression using Polars backend.
+    
+    For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression).
     
     Parameters
     ----------
@@ -510,15 +617,22 @@ def leanfe_compress_polars(
     weights : str, optional
         Weight column
     vcov : str
-        "iid" or "HC1"
+        "iid", "HC1", or "cluster"
+    cluster_col : str, optional
+        Cluster column (required if vcov="cluster")
+    ssc : bool
+        Small sample correction for cluster SEs
         
     Returns
     -------
     dict
         Regression results
     """
-    # Compress data
-    compressed, n_obs = compress_polars(df, y_col, x_cols, fe_cols, weights)
+    # Compress data (include cluster in grouping for cluster SEs)
+    compressed, n_obs = compress_polars(
+        df, y_col, x_cols, fe_cols, weights, 
+        cluster_col=cluster_col if vcov.lower() == "cluster" else None
+    )
     n_compressed = len(compressed)
     
     # Build design matrix
@@ -536,8 +650,24 @@ def leanfe_compress_polars(
     p = len(all_cols)
     df_resid = n_obs - p
     
+    # For cluster SEs, compute e0_g = sum_y - n * yhat (sum of residuals per group)
+    cluster_ids = None
+    e0_g = None
+    if vcov.lower() == "cluster" and cluster_col is not None:
+        cluster_ids = compressed[cluster_col].to_numpy()
+        n_g = compressed["_n"].to_numpy()
+        sum_y_g = compressed["_sum_y"].to_numpy()
+        if sparse.issparse(X):
+            yhat_g = np.asarray(X @ beta).flatten()
+        else:
+            yhat_g = X @ beta
+        e0_g = sum_y_g - n_g * yhat_g  # ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ
+    
     # Standard errors
-    se = compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols)
+    se, n_clusters = compute_se_compress(
+        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols,
+        cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
+    )
     
     # Extract coefficients for x_cols only
     beta_x = beta[:len(x_cols)]
@@ -552,6 +682,7 @@ def leanfe_compress_polars(
         "strategy": "compress",
         "df_resid": df_resid,
         "rss": rss_total,
+        "n_clusters": n_clusters,
     }
 
 
@@ -561,10 +692,15 @@ def leanfe_compress_duckdb(
     x_cols: List[str],
     fe_cols: List[str],
     weights: Optional[str] = None,
-    vcov: str = "iid"
+    vcov: str = "iid",
+    cluster_col: Optional[str] = None,
+    ssc: bool = False
 ) -> Dict:
     """
     Run compressed regression using DuckDB backend.
+    
+    For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression)
+    using sparse matrices for efficient cluster score aggregation.
     
     Parameters
     ----------
@@ -579,15 +715,22 @@ def leanfe_compress_duckdb(
     weights : str, optional
         Weight column
     vcov : str
-        "iid" or "HC1"
+        "iid", "HC1", or "cluster"
+    cluster_col : str, optional
+        Cluster column (required if vcov="cluster")
+    ssc : bool
+        Small sample correction for cluster SEs
         
     Returns
     -------
     dict
         Regression results
     """
-    # Compress data
-    compressed, n_obs = compress_duckdb(con, y_col, x_cols, fe_cols, weights)
+    # Compress data (include cluster in grouping for cluster SEs)
+    compressed, n_obs = compress_duckdb(
+        con, y_col, x_cols, fe_cols, weights,
+        cluster_col=cluster_col if vcov.lower() == "cluster" else None
+    )
     n_compressed = len(compressed)
     
     # Build design matrix
@@ -605,8 +748,25 @@ def leanfe_compress_duckdb(
     p = len(all_cols)
     df_resid = n_obs - p
     
+    # For cluster SEs, compute e0_g = sum_y - n * yhat (sum of residuals per group)
+    cluster_ids = None
+    e0_g = None
+    n_clusters = None
+    if vcov.lower() == "cluster" and cluster_col is not None:
+        cluster_ids = compressed[cluster_col]
+        n_g = compressed["_n"]
+        sum_y_g = compressed["_sum_y"]
+        if sparse.issparse(X):
+            yhat_g = np.asarray(X @ beta).flatten()
+        else:
+            yhat_g = X @ beta
+        e0_g = sum_y_g - n_g * yhat_g  # ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ
+    
     # Standard errors
-    se = compute_se_compress(XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols)
+    se, n_clusters = compute_se_compress(
+        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols,
+        cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
+    )
     
     # Extract coefficients for x_cols only
     beta_x = beta[:len(x_cols)]
@@ -621,4 +781,5 @@ def leanfe_compress_duckdb(
         "strategy": "compress",
         "df_resid": df_resid,
         "rss": rss_total,
+        "n_clusters": n_clusters,
     }

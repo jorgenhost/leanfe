@@ -9,14 +9,17 @@ leanfe is designed for speed and memory efficiency. It uses **YOCO (You Only Com
 
 ## How It Works
 
-For IID and HC1 standard errors, leanfe automatically:
+For **all standard error types** (IID, HC1, and clustered), leanfe automatically:
 
-1. **Compresses data**: GROUP BY (regressors + fixed effects) → compute `n`, `sum(y)`, `sum(y²)` per group
+1. **Compresses data**: GROUP BY (regressors + fixed effects + cluster) → compute `n`, `sum(y)`, `sum(y²)` per group
 2. **Builds sparse design matrix**: FE dummies as scipy.sparse/Matrix (13x faster than dense)
 3. **Solves weighted least squares**: On compressed data with sparse operations (7x faster)
-4. **Computes standard errors**: From grouped residual sum of squares
+4. **Computes standard errors**: From grouped sufficient statistics
+5. **For clustered SEs**: Uses sparse cluster matrix W̃_C for vectorized score aggregation (Section 5.3.1)
 
 This is **lossless** - coefficients and standard errors are identical to the full computation, but up to **23x faster** at scale.
+
+See [Clustered SE Benchmarks](cluster-se.qmd) for detailed performance analysis of cluster-robust inference.
 
 ## Key Findings
 

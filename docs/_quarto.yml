@@ -32,6 +32,8 @@ website:
         menu:
           - text: "Overview"
             href: benchmarks/overview.qmd
+          - text: "Clustered SEs"
+            href: benchmarks/cluster-se.qmd
           - text: "Methodology"
             href: benchmarks/methodology.qmd
       - text: "Reference"

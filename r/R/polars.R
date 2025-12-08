@@ -245,19 +245,22 @@ leanfe_polars <- function(
   
   if (use_compress) {
     # Use YOCO compression strategy - much faster for discrete regressors
+    # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
+    cluster_col <- if (vcov == "cluster" && !is.null(cluster_cols)) cluster_cols[1] else NULL
     result <- .leanfe_compress_polars(
       df = df,
       y_col = y_col,
       x_cols = x_cols,
       fe_cols = fe_cols,
       weights = weights,
-      vcov = vcov
+      vcov = vcov,
+      cluster_col = cluster_col,
+      ssc = ssc
     )
     # Add missing fields for compatibility
     result$iterations <- 0L
     result$is_iv <- FALSE
     result$n_instruments <- NULL
-    result$n_clusters <- NULL
     return(result)
   }
   
