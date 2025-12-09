@@ -240,8 +240,21 @@ leanfe_polars <- function(
   }
   
   # Check if we should use compression strategy (faster for IID/HC1 without IV)
+  # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
   is_iv <- length(instruments) > 0
-  use_compress <- .should_use_compress(vcov, is_iv)
+  
+  # Compute FE cardinality to decide strategy
+  fe_cardinality <- list()
+  for (fe in fe_cols) {
+    fe_cardinality[[fe]] <- df$select(pl$col(fe)$n_unique())$to_list()[[1]]
+  }
+  n_obs_initial <- df$height
+  use_compress <- .should_use_compress(
+    vcov, is_iv, fe_cardinality,
+    max_fe_levels = 10000,
+    n_obs = n_obs_initial,
+    n_x_cols = length(x_cols)
+  )
   
   if (use_compress) {
     # Use YOCO compression strategy - much faster for discrete regressors
@@ -285,9 +298,15 @@ leanfe_polars <- function(
   n_obs <- df$height
   cols_to_demean <- c(y_col, x_cols, instruments)
   
+  # Order FEs by cardinality (low-card first) for faster convergence
+  # Low-cardinality FEs have fewer groups, making GROUP BY operations faster.
+  # Processing them first quickly reduces variation in the data.
+  fe_card_values <- sapply(fe_cols, function(fe) fe_cardinality[[fe]])
+  fe_cols_ordered <- fe_cols[order(fe_card_values, decreasing = FALSE)]
+  
   # FWL demeaning
   for (it in 1:max_iter) {
-    for (fe in fe_cols) {
+    for (fe in fe_cols_ordered) {
       if (!is.null(weights)) {
         agg_exprs <- lapply(cols_to_demean, function(c) {
           (pl$col(c) * pl$col(weights))$sum()$truediv(pl$col(weights)$sum())$alias(paste0(c, "_mean"))

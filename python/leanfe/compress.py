@@ -18,13 +18,27 @@ from scipy.sparse.linalg import spsolve
 from typing import List, Optional, Dict, Tuple
 
 
-def should_use_compress(vcov: str, has_instruments: bool) -> bool:
+def should_use_compress(
+    vcov: str,
+    has_instruments: bool,
+    fe_cardinality: Optional[dict] = None,
+    max_fe_levels: int = 10000,
+    n_obs: Optional[int] = None,
+    n_x_cols: Optional[int] = None,
+    estimated_compression_ratio: Optional[float] = None
+) -> bool:
     """
     Determine if compression strategy should be used.
     
-    Compression is used when:
-    - vcov is "iid", "HC1", or "cluster" (all supported with YOCO)
-    - No instrumental variables
+    The decision is based on estimating which approach is faster:
+    
+    YOCO Compression:
+    - Cost ≈ O(n_obs) for GROUP BY + O(n_compressed * total_fe_levels) for sparse matrix
+    - Fast when: good compression ratio AND low total FE levels
+    
+    FWL Demeaning:
+    - Cost ≈ O(n_obs * n_fe * n_iterations) for iterative demeaning
+    - Fast when: high-cardinality FEs (avoids huge sparse matrix)
     
     Parameters
     ----------
@@ -32,14 +46,63 @@ def should_use_compress(vcov: str, has_instruments: bool) -> bool:
         Variance-covariance type
     has_instruments : bool
         Whether IV/2SLS is being used
+    fe_cardinality : dict, optional
+        Dictionary mapping FE column names to their cardinality.
+    max_fe_levels : int, default 10000
+        Maximum FE cardinality to allow compression.
+    n_obs : int, optional
+        Number of observations (for cost estimation)
+    n_x_cols : int, optional
+        Number of X columns (for cost estimation)
+    estimated_compression_ratio : float, optional
+        Estimated compression ratio (n_compressed / n_obs). If provided, used
+        for more accurate cost estimation.
         
     Returns
     -------
     bool
         True if compression should be used
     """
+    # Basic checks
     vcov_ok = vcov.lower() in ("iid", "hc1", "cluster")
-    return vcov_ok and not has_instruments
+    if not vcov_ok or has_instruments:
+        return False
+    
+    if fe_cardinality is None:
+        return True  # Default to compression if no info
+    
+    # Calculate total FE levels
+    total_fe_levels = sum(fe_cardinality.values())
+    max_single_fe = max(fe_cardinality.values()) if fe_cardinality else 0
+    
+    # Rule 1: If any single FE is very high-cardinality, use FWL
+    # Building a sparse matrix with 100K+ columns is slow
+    if max_single_fe > max_fe_levels:
+        return False
+    
+    # Rule 2: If total FE levels is very high, use FWL
+    # Even if no single FE is huge, many medium FEs can add up
+    if total_fe_levels > max_fe_levels * 2:
+        return False
+    
+    # Rule 3: If we have compression ratio estimate, use cost model
+    if estimated_compression_ratio is not None and n_obs is not None:
+        n_compressed = int(n_obs * estimated_compression_ratio)
+        
+        # Estimate YOCO cost: GROUP BY + sparse matrix build + WLS solve
+        # Sparse matrix: n_compressed rows × total_fe_levels columns
+        yoco_cost = n_obs + n_compressed * total_fe_levels + total_fe_levels ** 2
+        
+        # Estimate FWL cost: ~10 iterations × n_fe × n_obs GROUP BY operations
+        n_fe = len(fe_cardinality)
+        fwl_cost = 10 * n_fe * n_obs
+        
+        # Use YOCO if it's estimated to be faster
+        return yoco_cost < fwl_cost
+    
+    # Default: use compression for low-cardinality FEs
+    return True
+    return True
 
 
 def compress_polars(

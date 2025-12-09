@@ -228,19 +228,27 @@ def compute_standard_errors(
         if cluster_ids is None:
             raise ValueError("cluster_ids required for vcov='cluster'")
         
-        # Get unique clusters
-        unique_clusters = np.unique(cluster_ids)
+        # Get unique clusters and build cluster mapping
+        unique_clusters, cluster_map = np.unique(cluster_ids, return_inverse=True)
         n_clusters = len(unique_clusters)
         k = X.shape[1]
         
-        # Compute cluster scores: score_g = sum(X_i * e_i) for each cluster g
-        scores = np.zeros((n_clusters, k))
-        for g, cluster in enumerate(unique_clusters):
-            mask = cluster_ids == cluster
-            if weights is not None:
-                scores[g] = np.sum(X[mask] * (resid[mask] * weights[mask])[:, np.newaxis], axis=0)
-            else:
-                scores[g] = np.sum(X[mask] * resid[mask][:, np.newaxis], axis=0)
+        # VECTORIZED: Build sparse cluster indicator matrix W_C (n_obs x n_clusters)
+        # W_C[i, g] = 1 if observation i belongs to cluster g
+        from scipy import sparse
+        W_C = sparse.csr_matrix(
+            (np.ones(n_obs), (np.arange(n_obs), cluster_map)),
+            shape=(n_obs, n_clusters)
+        )
+        
+        # Compute scores: X_resid = X * resid (element-wise), then aggregate by cluster
+        # scores = W_C.T @ X_resid  (n_clusters x k)
+        if weights is not None:
+            X_resid = X * (resid * weights)[:, np.newaxis]
+        else:
+            X_resid = X * resid[:, np.newaxis]
+        
+        scores = (W_C.T @ X_resid)  # (n_clusters x k)
         
         # Meat matrix: S'S
         meat = scores.T @ scores

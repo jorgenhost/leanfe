@@ -231,8 +231,27 @@ def leanfe_polars(
         x_cols = x_cols + dummy_cols
     
     # Check if we should use compression strategy (faster for IID/HC1 without IV)
+    # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
     is_iv = len(instruments) > 0
-    use_compress = should_use_compress(vcov, is_iv)
+    
+    # Compute FE cardinality to decide strategy
+    fe_cardinality = {fe: df.select(pl.col(fe).n_unique()).item() for fe in fe_cols}
+    
+    # Strategy selection based on cost estimation:
+    # - YOCO compression: fast when good compression ratio AND low total FE levels
+    # - FWL demeaning: fast when high-cardinality FEs (avoids huge sparse matrix)
+    #
+    # NOTE: A "hybrid" approach (demean high-card FEs, then YOCO on low-card) was tested
+    # but is mathematically incorrect. After partial demeaning, Y still has non-zero means
+    # within low-card FE groups, so adding dummies doesn't give the same result as full FWL.
+    MAX_FE_LEVELS = 10000
+    n_obs_initial = len(df)
+    use_compress = should_use_compress(
+        vcov, is_iv, fe_cardinality,
+        max_fe_levels=MAX_FE_LEVELS,
+        n_obs=n_obs_initial,
+        n_x_cols=len(x_cols)
+    )
     
     if use_compress:
         # Use YOCO compression strategy - much faster for discrete regressors
@@ -274,9 +293,14 @@ def leanfe_polars(
     n_obs = len(df)
     cols_to_demean = [y_col] + x_cols + instruments
     
+    # Order FEs by cardinality (low-card first) for faster convergence
+    # Low-cardinality FEs have fewer groups, making GROUP BY operations faster.
+    # Processing them first quickly reduces variation in the data.
+    fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+    
     # FWL demeaning
     for it in range(1, max_iter + 1):
-        for fe in fe_cols:
+        for fe in fe_cols_ordered:
             if weights is not None:
                 means = df.group_by(fe).agg([
                     (pl.col(c) * pl.col(weights)).sum().truediv(pl.col(weights).sum()).alias(f"{c}_mean") 

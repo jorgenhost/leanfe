@@ -188,21 +188,29 @@
       stop("cluster_ids required for vcov='cluster'")
     }
     
-    # Get unique clusters
+    # Get unique clusters and build cluster mapping
     unique_clusters <- unique(cluster_ids)
     n_clusters <- length(unique_clusters)
-    k <- ncol(X)
+    cluster_map <- match(cluster_ids, unique_clusters)
     
-    # Compute cluster scores: score_g = sum(X_i * e_i) for each cluster g
-    scores <- matrix(0, n_clusters, k)
-    for (g in seq_along(unique_clusters)) {
-      mask <- cluster_ids == unique_clusters[g]
-      if (!is.null(weights)) {
-        scores[g, ] <- colSums(X[mask, , drop = FALSE] * (resid[mask] * weights[mask]))
-      } else {
-        scores[g, ] <- colSums(X[mask, , drop = FALSE] * resid[mask])
-      }
+    # VECTORIZED: Build sparse cluster indicator matrix W_C (n_obs x n_clusters)
+    # W_C[i, g] = 1 if observation i belongs to cluster g
+    W_C <- Matrix::sparseMatrix(
+      i = seq_len(n_obs),
+      j = cluster_map,
+      x = rep(1, n_obs),
+      dims = c(n_obs, n_clusters)
+    )
+    
+    # Compute scores: X_resid = X * resid (element-wise), then aggregate by cluster
+    # scores = W_C' @ X_resid  (n_clusters x k)
+    if (!is.null(weights)) {
+      X_resid <- X * (resid * weights)
+    } else {
+      X_resid <- X * resid
     }
+    
+    scores <- as.matrix(Matrix::crossprod(W_C, X_resid))  # (n_clusters x k)
     
     # Meat matrix: S'S
     meat <- crossprod(scores)

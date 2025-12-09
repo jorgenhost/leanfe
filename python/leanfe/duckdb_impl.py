@@ -173,8 +173,21 @@ def leanfe_duckdb(
                     x_cols.append(col_name)
         
         # Check if we should use compression strategy (faster for IID/HC1 without IV)
+        # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
         is_iv = len(instruments) > 0
-        use_compress = should_use_compress(vcov, is_iv)
+        
+        # Compute FE cardinality to decide strategy
+        fe_cardinality = {}
+        for fe in fe_cols:
+            card = con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0]
+            fe_cardinality[fe] = card
+        n_obs_initial = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+        use_compress = should_use_compress(
+            vcov, is_iv, fe_cardinality,
+            max_fe_levels=10000,
+            n_obs=n_obs_initial,
+            n_x_cols=len(x_cols)
+        )
         
         if use_compress:
             # Use YOCO compression strategy - much faster and lower memory
@@ -206,6 +219,9 @@ def leanfe_duckdb(
         n_obs = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
         cols_to_demean = [y_col] + x_cols + instruments
         
+        # Order FEs by cardinality (low-card first) for faster convergence
+        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+        
         # Add demeaned columns
         for col in cols_to_demean:
             con.execute(f"ALTER TABLE data ADD COLUMN {col}_dm DOUBLE")
@@ -215,7 +231,7 @@ def leanfe_duckdb(
         
         # Iterative demeaning
         for it in range(1, max_iter + 1):
-            for fe in fe_cols:
+            for fe in fe_cols_ordered:
                 if weights is not None:
                     for col in dm_cols:
                         con.execute(f"""

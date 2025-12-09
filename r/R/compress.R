@@ -13,13 +13,74 @@ NULL
 
 #' Check if compression strategy should be used
 #'
+#' The decision is based on estimating which approach is faster:
+#'
+#' YOCO Compression:
+#' - Cost ~ O(n_obs) for GROUP BY + O(n_compressed * total_fe_levels) for sparse matrix
+#' - Fast when: good compression ratio AND low total FE levels
+#'
+#' FWL Demeaning:
+#' - Cost ~ O(n_obs * n_fe * n_iterations) for iterative demeaning
+#' - Fast when: high-cardinality FEs (avoids huge sparse matrix)
+#'
 #' @param vcov Variance-covariance type
 #' @param has_instruments Whether IV/2SLS is being used
+#' @param fe_cardinality Named list mapping FE column names to their cardinality.
+#' @param max_fe_levels Maximum FE cardinality to allow compression (default: 10000).
+#' @param n_obs Number of observations (for cost estimation, optional).
+#' @param n_x_cols Number of X columns (for cost estimation, optional).
+#' @param estimated_compression_ratio Estimated compression ratio (optional).
 #' @return Logical
 #' @keywords internal
-.should_use_compress <- function(vcov, has_instruments) {
-  vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
-  return(vcov_ok && !has_instruments)
+.should_use_compress <- function(
+    vcov,
+    has_instruments,
+    fe_cardinality = NULL,
+    max_fe_levels = 10000,
+    n_obs = NULL,
+    n_x_cols = NULL,
+    estimated_compression_ratio = NULL
+) {
+  # Basic checks
+
+vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
+  if (!vcov_ok || has_instruments) {
+    return(FALSE)
+  }
+
+  if (is.null(fe_cardinality)) {
+    return(TRUE)
+  }
+
+  # Calculate total FE levels
+  total_fe_levels <- sum(unlist(fe_cardinality))
+  max_single_fe <- max(unlist(fe_cardinality))
+
+  # Rule 1: If any single FE is very high-cardinality, use FWL
+  if (max_single_fe > max_fe_levels) {
+    return(FALSE)
+  }
+
+  # Rule 2: If total FE levels is very high, use FWL
+  if (total_fe_levels > max_fe_levels * 2) {
+    return(FALSE)
+  }
+
+  # Rule 3: If we have compression ratio estimate, use cost model
+  if (!is.null(estimated_compression_ratio) && !is.null(n_obs)) {
+    n_compressed <- as.integer(n_obs * estimated_compression_ratio)
+
+    # Estimate YOCO cost
+    yoco_cost <- n_obs + n_compressed * total_fe_levels + total_fe_levels^2
+
+    # Estimate FWL cost
+    n_fe <- length(fe_cardinality)
+    fwl_cost <- 10 * n_fe * n_obs
+
+    return(yoco_cost < fwl_cost)
+  }
+
+  return(TRUE)
 }
 
 
