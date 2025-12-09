@@ -153,9 +153,6 @@ library(duckdb)
 library(DBI)
 library(Matrix)
 
-# Source additional leanfe R files
-source("../../r/R/compress.R")
-
 set.seed(42)
 
 generate_benchmark_data <- function(n_obs, n_fe1 = 500, n_fe2 = 100) {

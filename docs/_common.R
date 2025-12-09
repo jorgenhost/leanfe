@@ -17,6 +17,7 @@ if (!dir.exists(pkg_dir)) {
 # Source all R files
 if (dir.exists(pkg_dir)) {
   source(file.path(pkg_dir, "common.R"))
+  source(file.path(pkg_dir, "compress.R"))
   source(file.path(pkg_dir, "duckdb.R"))
   source(file.path(pkg_dir, "polars.R"))
   source(file.path(pkg_dir, "leanfe.R"))
