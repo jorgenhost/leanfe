@@ -1,6 +1,12 @@
 # Common R setup for leanfe documentation
 # Source this file at the beginning of R code blocks to load leanfe functions
 
+# Configure reticulate to use system Python (for CI environments)
+if (Sys.getenv("RETICULATE_PYTHON") != "") {
+  library(reticulate)
+  use_python(Sys.getenv("RETICULATE_PYTHON"), required = TRUE)
+}
+
 # Get the package R directory relative to docs
 pkg_dir <- normalizePath(file.path(dirname(getwd()), "r", "R"), mustWork = FALSE)
 if (!dir.exists(pkg_dir)) {

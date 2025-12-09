@@ -42,6 +42,15 @@ jobs:
           Rscript -e 'install.packages(c("knitr", "rmarkdown", "reticulate", "duckdb", "DBI", "Matrix"))'
           Rscript -e 'install.packages("polars", repos = "https://community.r-multiverse.org")'
 
+      - name: Configure reticulate to use system Python
+        run: |
+          PYTHON_PATH=$(which python)
+          echo "RETICULATE_PYTHON=$PYTHON_PATH" >> $GITHUB_ENV
+          echo "Python path: $PYTHON_PATH"
+          python --version
+          python -c "import polars; print(f'polars {polars.__version__}')"
+          Rscript -e 'library(reticulate); Sys.setenv(RETICULATE_PYTHON = Sys.which("python")); use_python(Sys.which("python"), required = TRUE); py_config()'
+
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
 

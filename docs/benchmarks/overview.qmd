@@ -145,16 +145,16 @@ R benchmarks use the same data generation and test the R Polars and R DuckDB bac
 #| output: true
 #| eval: true
 
+# Source common setup (configures reticulate for CI)
+source("../_common.R")
+
 library(polars)
 library(duckdb)
 library(DBI)
 library(Matrix)
 
-# Source leanfe R package
-source("../../r/R/common.R")
+# Source additional leanfe R files
 source("../../r/R/compress.R")
-source("../../r/R/polars.R")
-source("../../r/R/duckdb.R")
 
 set.seed(42)
 
