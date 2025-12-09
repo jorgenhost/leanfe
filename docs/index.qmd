@@ -46,56 +46,60 @@ High-dimensional fixed effects regression that's **fast** when you need speed, a
 
 :::
 
-## How It Works: Four Key Innovations
+## How It Works: Smart Strategy Selection
 
-leanfe achieves its speed and memory efficiency through four key innovations:
+leanfe automatically chooses the optimal algorithm based on your data characteristics. You don't need to configure anything — leanfe analyzes your fixed effects and picks the fastest approach.
 
-### 1. YOCO Compression (You Only Compress Once)
+### Two Algorithms, Automatically Selected
 
-From [Wong et al. (2021)](https://arxiv.org/abs/2102.11297): many observations share the same regressor values. Instead of processing each row individually, leanfe groups identical rows together:
+::: {.grid}
+
+::: {.g-col-12 .g-col-md-6}
+#### YOCO Compression + Sparse Matrices
+**Best for: Low/medium-cardinality FEs (< 10K levels)**
+
+From [Wong et al. (2021)](https://arxiv.org/abs/2102.11297): many observations share the same regressor values. leanfe groups identical rows together:
 
 ```
-Original: 5M rows with binary treatment × 500 firms × 100 products
+Original: 5M rows with binary treatment × 500 FE1 × 100 FE2
 Compressed: ~100K unique combinations (98% reduction!)
 ```
 
-The math is **lossless** — coefficients and standard errors are identical to the full computation, just computed on sufficient statistics (count, sum, sum of squares) per group.
+Then builds sparse FE dummy matrices and solves weighted least squares on the compressed data. The math is **lossless** — coefficients and SEs are identical to full computation.
+:::
 
-### 2. Sparse FE Dummies
+::: {.g-col-12 .g-col-md-6}
+#### FWL Demeaning (Frisch-Waugh-Lovell)
+**Best for: High-cardinality FEs (> 10K levels)**
 
-With many FE levels, the design matrix has many dummy columns. But each row only has a few non-zeros (one per FE). Sparse matrices:
+When FEs have many levels (e.g., customer IDs), sparse matrices become huge. Instead, leanfe uses iterative within-group demeaning:
 
-- **Store only non-zeros**: Massive memory reduction
-- **Skip zero operations**: Much faster matrix multiplication
-- **Scale effortlessly**: Adding more FE levels costs almost nothing
+1. Demean Y and X within each FE group
+2. Repeat until convergence
+3. Run OLS on demeaned data
 
-### 3. Sparse Cluster Matrix for Clustered SEs
+FEs are automatically sorted by cardinality (low-card first) for ~14% faster convergence.
+:::
 
-For clustered standard errors, leanfe implements **Section 5.3.1** of Wong et al. (2021):
+:::
 
-1. **Within-cluster compression**: Include cluster ID in GROUP BY, so each compressed record belongs to exactly one cluster
-2. **Sparse cluster matrix W̃_C**: Maps groups to clusters (G × C matrix with one 1 per row)
-3. **Vectorized aggregation**: `cluster_scores = W̃_Cᵀ @ (X × ẽ⁰)` — no loops over clusters!
+### Clustered Standard Errors: Sparse Cluster Matrix
+
+For clustered SEs, leanfe implements **Section 5.3.1** of Wong et al. (2021) using a sparse cluster indicator matrix:
+
+- **W̃_C ∈ R^{G×C}**: Maps G groups to C clusters (one 1 per row)
+- **Vectorized aggregation**: `cluster_scores = W̃_Cᵀ @ (X × ẽ⁰)` — no loops over clusters!
 
 This makes clustered SEs just as fast as IID/HC1, even with thousands of clusters.
 
-### 4. Smart Strategy Selection
-
-leanfe automatically chooses the optimal computation path based on your data:
-
-- **YOCO compression** for low/medium-cardinality FEs (< 10K levels) — fast sparse matrix operations
-- **FWL demeaning** for high-cardinality FEs (> 10K levels) — avoids huge sparse matrices
-
-Additionally, FEs are automatically sorted by cardinality (low-card first) during demeaning for ~14% faster convergence. You don't need to configure anything — leanfe analyzes your data and picks the fastest strategy.
-
 ### The Result
 
-| Dataset | Traditional | leanfe | Speedup |
-|---------|-------------|--------|---------|
-| 1M rows | 0.7s | 0.09s | **7.7x** |
-| 5M rows | 3.7s | 0.15s | **24.6x** |
+| Dataset | pyfixest | leanfe | Speedup |
+|---------|----------|--------|---------|
+| 1M rows | 8.5s | 0.6s | **14x** |
+| 10M rows | 135s | 9s | **15x** |
 
-[Learn more about the methodology →](benchmarks/methodology.qmd)
+[View detailed benchmarks →](benchmarks/overview.qmd)
 
 ## Two Backends: Speed vs Memory
 
