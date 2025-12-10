@@ -7,10 +7,15 @@ subtitle: "Comparing leanfe vs pyfixest and fixest"
 
 leanfe is designed for speed and memory efficiency. It automatically selects the optimal algorithm based on your data:
 
-- **YOCO compression + sparse matrices** for low/medium-cardinality FEs (< 10K levels)
-- **FWL iterative demeaning** for high-cardinality FEs (> 10K levels)
+- **YOCO compression + sparse matrices** for low/medium-cardinality FEs (< 10K levels per FE, < 20K total)
+- **FWL iterative demeaning** for high-cardinality FEs (> 10K levels per FE or > 20K total)
 
 Both approaches produce **identical results** to traditional methods, just faster.
+
+::: {.callout-tip}
+## Comprehensive Benchmarks
+For detailed benchmarks across **all 4 backend/language combinations** (Python/Polars, Python/DuckDB, R/Polars, R/DuckDB) and **all dataset sizes** (100K to 100M), see [Comprehensive Benchmarks](comprehensive.qmd).
+:::
 
 ## How It Works
 
@@ -128,6 +133,7 @@ def run_benchmark(n_obs, include_pyfixest=True):
     _, results["py_polars_mem"] = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     results["compression"] = result_polars.get("compression_ratio", 1.0)
+    results["strategy"] = result_polars.get("strategy", "compress" if result_polars.get("n_compressed") else "fwl")
     
     # leanfe DuckDB benchmark
     gc.collect()
@@ -159,16 +165,17 @@ sizes = [100_000, 1_000_000, 10_000_000]
 py_results = []
 
 print("Python IID Standard Errors Benchmark (Two-way FE)")
-print("=" * 95)
-print(f"{'Obs':>12} {'leanfe-Polars':>14} {'leanfe-DuckDB':>14} {'pyfixest':>12} {'Speedup':>10}")
-print("-" * 95)
+print("=" * 105)
+print(f"{'Obs':>12} {'leanfe-Polars':>14} {'leanfe-DuckDB':>14} {'pyfixest':>12} {'Speedup':>10} {'Strategy':>12}")
+print("-" * 105)
 
 for n in sizes:
     result = run_benchmark(n, include_pyfixest=HAS_PYFIXEST and (n <= 1_000_000))
     py_results.append(result)
     pyfixest_str = f"{result['pyfixest_time']:.2f}s" if result['pyfixest_time'] else "skipped"
     speedup = f"{result['pyfixest_time'] / result['py_polars_time']:.1f}x" if result['pyfixest_time'] else "-"
-    print(f"{n:>12,} {result['py_polars_time']:>13.2f}s {result['py_duckdb_time']:>13.2f}s {pyfixest_str:>12} {speedup:>10}")
+    strategy = result.get('strategy', 'compress')
+    print(f"{n:>12,} {result['py_polars_time']:>13.2f}s {result['py_duckdb_time']:>13.2f}s {pyfixest_str:>12} {speedup:>10} {strategy:>12}")
 
 pyfixest_note = "pyfixest skipped for 10M rows (too slow)" if HAS_PYFIXEST else "pyfixest not installed"
 print(f"\nNote: {pyfixest_note}")
@@ -244,19 +251,21 @@ run_r_benchmark <- function(n_obs) {
 sizes <- c(100000, 1000000, 10000000)
 
 cat("R IID Standard Errors Benchmark (Two-way FE)\n")
-cat(strrep("=", 95), "\n")
-cat(sprintf("%12s %14s %14s %12s %10s\n", "Obs", "leanfe-Polars", "leanfe-DuckDB", "fixest", "Speedup"))
-cat(strrep("-", 95), "\n")
+cat(strrep("=", 105), "\n")
+cat(sprintf("%12s %14s %14s %12s %10s %12s\n", "Obs", "leanfe-Polars", "leanfe-DuckDB", "fixest", "Speedup", "Strategy"))
+cat(strrep("-", 105), "\n")
 
 for (n in sizes) {
   result <- run_r_benchmark(n)
   speedup <- result$fixest_time / result$r_polars_time
-  cat(sprintf("%12s %13.2fs %13.2fs %11.2fs %9.1fx\n", 
+  strategy <- if (!is.null(result$compression) && result$compression < 1) "compress" else "fwl"
+  cat(sprintf("%12s %13.2fs %13.2fs %11.2fs %9.1fx %12s\n", 
               format(n, big.mark = ",", scientific = FALSE), 
               result$r_polars_time, 
               result$r_duckdb_time,
               result$fixest_time,
-              speedup))
+              speedup,
+              strategy))
 }
 ```
 

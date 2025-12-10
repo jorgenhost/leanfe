@@ -35,13 +35,111 @@ The sparse cluster matrix W̃_C enables **vectorized aggregation** across all cl
 
 This is **lossless** - coefficients and standard errors are identical to the full computation, but up to **23x faster** for discrete regressors at scale.
 
-### Why Sparse Matrices?
+### Why Sparse Matrices? (leanfe's Contribution)
 
-With many FE levels, the design matrix has many columns but only a few non-zeros per row (one per FE). Sparse matrices:
+The original YOCO paper by Wong et al. (2021) describes the compression strategy and the mathematical framework for computing coefficients and standard errors from sufficient statistics. However, the paper focuses on the statistical methodology and does not address the practical implementation challenge of how to efficiently represent the design matrix when fixed effects are included.
 
-- **Memory**: Store only non-zero entries
-- **Speed**: Skip zero multiplications in matrix operations
-- **Scalability**: Time stays nearly constant regardless of FE cardinality
+Specifically, the paper:
+
+- ✅ Describes compression via GROUP BY on features (M̃, ỹ⁰, ỹ⁰⁰, ñ)
+- ✅ Shows how to compute β̂ and V(β̂) from compressed data
+- ✅ Covers IID, HC1, and clustered standard errors
+- ❌ Does not discuss how to handle FE dummy variables efficiently
+- ❌ Does not mention sparse matrices
+
+leanfe extends YOCO with **sparse matrices** for the FE dummy variables. This is a natural and mathematically equivalent extension that provides significant performance benefits.
+
+#### The Problem: Dense FE Dummies Are Wasteful
+
+After YOCO compression, we have G groups (compressed rows) and need to estimate:
+
+$$\bar{y}_g = X_g \beta + D_g \gamma + \epsilon_g$$
+
+where $D_g$ is a matrix of FE dummy variables. With F total FE levels across all FEs, $D$ has dimensions G × (F-1). For example:
+
+- G = 50,000 compressed groups
+- F = 600 FE levels (500 + 100)
+- Dense $D$ matrix: 50,000 × 599 = **30 million entries**
+
+But each row of $D$ has only **one 1 per FE** (and zeros elsewhere). With 2 FEs, each row has exactly 2 non-zero entries out of 599 columns — that's **99.7% zeros**.
+
+#### The Solution: Sparse Matrix Representation
+
+Sparse matrices store only non-zero entries as (row, column, value) triplets:
+
+| Representation | Storage for G=50K, F=600 |
+|----------------|--------------------------|
+| Dense matrix | 30 million floats (~240 MB) |
+| Sparse matrix | 100K triplets (~2.4 MB) |
+| **Savings** | **~100x less memory** |
+
+#### Why This Works Mathematically
+
+The key insight is that **sparse matrix operations are mathematically identical to dense operations** — they just skip the zero multiplications:
+
+```
+# Dense: X'X computes all G×F×F multiplications
+XtX_dense = X.T @ X  # O(G × F²)
+
+# Sparse: X'X only computes non-zero contributions  
+XtX_sparse = X_sparse.T @ X_sparse  # O(G × nnz_per_row × F)
+```
+
+Since `nnz_per_row` (non-zeros per row) equals the number of FEs (typically 2-3), sparse operations are **O(F) faster** than dense operations.
+
+#### Correctness Guarantee
+
+The sparse implementation produces **bit-identical results** to a dense implementation because:
+
+1. **Same linear algebra**: $X'X$, $X'y$, and $(X'X)^{-1}$ are computed identically
+2. **Same sufficient statistics**: YOCO's `n`, `sum(y)`, `sum(y²)` are unchanged
+3. **Same standard errors**: The sandwich formula uses the same matrices
+
+We validate this in our test suite by comparing sparse vs dense results.
+
+#### Performance Impact
+
+| Operation | Dense | Sparse | Speedup |
+|-----------|-------|--------|---------|
+| Build design matrix | O(G × F) | O(G × n_fe) | ~100x |
+| Matrix multiply X'X | O(G × F²) | O(G × n_fe × F) | ~100x |
+| Memory allocation | O(G × F) | O(G × n_fe) | ~100x |
+
+Where `n_fe` is the number of FE columns (typically 2-3) and `F` is total FE levels (can be 1000s).
+
+#### Implementation Details
+
+**Python** uses `scipy.sparse.csr_matrix`:
+```python
+from scipy import sparse
+
+# Build in COO format (fast construction)
+X_fe = sparse.coo_matrix((data, (rows, cols)), shape=(G, F-1))
+
+# Convert to CSR for fast arithmetic
+X_fe = X_fe.tocsr()
+
+# Combine with regressors
+X = sparse.hstack([X_reg_sparse, X_fe], format='csr')
+```
+
+**R** uses `Matrix::sparseMatrix`:
+```r
+library(Matrix)
+
+X_fe <- sparseMatrix(i = rows, j = cols, x = data, dims = c(G, F-1))
+X <- cbind(Matrix(X_reg, sparse = TRUE), X_fe)
+```
+
+#### When Sparse Matrices Help Most
+
+Sparse matrices provide the biggest benefit when:
+
+- **Many FE levels**: F > 100 (more columns to skip)
+- **Good compression**: G << N (fewer rows to process)
+- **Few FEs**: n_fe = 2-3 (very sparse rows)
+
+This is exactly the typical panel data scenario (firm + year FEs with discrete treatments).
 
 For clustered SEs, the cluster matrix W̃_C is also sparse (one 1 per row), enabling efficient score aggregation even with thousands of clusters.
 

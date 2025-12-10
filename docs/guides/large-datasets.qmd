@@ -7,7 +7,7 @@ subtitle: "Working with data larger than RAM"
 
 leanfe is optimized for large datasets through two key features:
 
-1. **YOCO Compression**: Automatically compresses data by grouping on (regressors + FEs), achieving 10-1000x compression for discrete regressors
+1. **YOCO Compression + Sparse Matrices**: Automatically compresses data by grouping on (regressors + FEs), then builds a sparse design matrix for FE dummies. Works for **all SE types** (IID, HC1, and clustered).
 2. **DuckDB Backend**: Streams data from disk, enabling analysis of datasets larger than RAM
 
 This guide covers:
@@ -19,7 +19,7 @@ This guide covers:
 
 ## Automatic Compression
 
-For IID and HC1 standard errors, leanfe automatically compresses your data:
+For **all standard error types** (IID, HC1, and clustered), leanfe automatically compresses your data when FE cardinality is low enough (≤10K per FE, ≤20K total). The sparse matrix approach is used regardless of SE type:
 
 ```{python}
 #| echo: true

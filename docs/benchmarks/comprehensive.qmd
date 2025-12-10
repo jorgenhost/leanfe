@@ -1,0 +1,305 @@
+---
+title: "Comprehensive Benchmarks"
+subtitle: "All backends, all sizes, all strategies"
+---
+
+## Overview
+
+This page provides comprehensive benchmarks across **all 4 backend/language combinations** and **all dataset sizes**, clearly showing which computational strategy (YOCO+sparse vs FWL demeaning) was used in each case.
+
+## Strategy Selection
+
+leanfe automatically selects the optimal strategy based on FE cardinality:
+
+| Condition | Strategy | Why |
+|-----------|----------|-----|
+| Max FE ≤ 10K, Total FE ≤ 20K, No IV | **YOCO + Sparse** | Compression + sparse matrices are efficient |
+| Max FE > 10K or Total FE > 20K | **FWL Demeaning** | Avoids huge sparse matrices |
+| IV/2SLS | **FWL Demeaning** | YOCO doesn't support instruments |
+
+In these benchmarks, we use FE1=500 and FE2=100 levels (total=600), so **YOCO + Sparse** is always selected.
+
+## Benchmark Configuration
+
+- **Dataset sizes**: 100K, 1M, 10M, 100M observations
+- **Fixed effects**: FE1 (500 levels) + FE2 (100 levels)
+- **Regressors**: Binary treatment + discrete x1 (0, 1, 2)
+- **Standard errors**: IID (all use YOCO path)
+- **Metrics**: Runtime (seconds), Peak memory (MB), Strategy used
+
+
+## Python Benchmarks
+
+```{python}
+#| echo: false
+#| output: true
+
+import numpy as np
+import polars as pl
+import time
+import tracemalloc
+import gc
+from leanfe import leanfe
+
+np.random.seed(42)
+
+def generate_benchmark_data(n_obs, n_fe1=500, n_fe2=100):
+    """Standardized benchmark data generation."""
+    fe1 = np.random.randint(1, n_fe1 + 1, n_obs)
+    fe2 = np.random.randint(1, n_fe2 + 1, n_obs)
+    fe1_effects = np.random.normal(0, 1, n_fe1 + 1)[fe1]
+    fe2_effects = np.random.normal(0, 0.5, n_fe2 + 1)[fe2]
+    
+    treatment = np.random.binomial(1, 0.3, n_obs).astype(float)
+    x1 = np.random.choice([0.0, 1.0, 2.0], n_obs)  # Discrete for compression
+    y = 2.5 * treatment + 1.5 * x1 + fe1_effects + fe2_effects + np.random.normal(0, 1, n_obs)
+    
+    return pl.DataFrame({
+        "y": y, "treatment": treatment, "x1": x1,
+        "fe1": fe1, "fe2": fe2,
+    })
+
+def run_python_benchmark(n_obs, backend):
+    """Run benchmark with time and memory measurement."""
+    gc.collect()
+    df = generate_benchmark_data(n_obs)
+    
+    gc.collect()
+    tracemalloc.start()
+    start = time.time()
+    result = leanfe(formula="y ~ treatment + x1 | fe1 + fe2", data=df, vcov="iid", backend=backend)
+    elapsed = time.time() - start
+    _, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    
+    strategy = result.get("strategy", "compress" if result.get("n_compressed") else "fwl")
+    compression = result.get("compression_ratio", None)
+    
+    return {
+        "time": elapsed,
+        "memory_mb": peak_mem / 1024 / 1024,
+        "strategy": strategy,
+        "compression": compression,
+        "n_compressed": result.get("n_compressed", None),
+    }
+
+# Run benchmarks
+sizes = [100_000, 1_000_000, 10_000_000, 100_000_000]
+py_results = []
+
+print("Python Comprehensive Benchmark (IID Standard Errors)")
+print("=" * 110)
+print(f"{'Obs':>12} {'Backend':>10} {'Time':>10} {'Memory':>12} {'Strategy':>12} {'Compressed':>12} {'Ratio':>10}")
+print("-" * 110)
+
+for n in sizes:
+    for backend in ["polars", "duckdb"]:
+        try:
+            result = run_python_benchmark(n, backend)
+            py_results.append({"n_obs": n, "backend": backend, **result})
+            
+            compressed_str = f"{result['n_compressed']:,}" if result['n_compressed'] else "N/A"
+            ratio_str = f"{result['compression']:.2%}" if result['compression'] else "N/A"
+            
+            print(f"{n:>12,} {backend:>10} {result['time']:>9.2f}s {result['memory_mb']:>10.1f}MB "
+                  f"{result['strategy']:>12} {compressed_str:>12} {ratio_str:>10}")
+        except Exception as e:
+            print(f"{n:>12,} {backend:>10} {'ERROR':>10} {str(e)[:30]}")
+            py_results.append({"n_obs": n, "backend": backend, "time": None, "memory_mb": None, 
+                             "strategy": "error", "compression": None, "n_compressed": None})
+
+print("\nNote: Strategy 'compress' = YOCO + Sparse Matrix path")
+```
+
+
+## R Benchmarks
+
+```{r}
+#| echo: false
+#| output: true
+#| eval: true
+
+# Source common setup
+source("../_common.R")
+
+library(polars)
+library(duckdb)
+library(DBI)
+library(Matrix)
+
+set.seed(42)
+
+generate_benchmark_data <- function(n_obs, n_fe1 = 500, n_fe2 = 100) {
+  fe1 <- sample(1:n_fe1, n_obs, replace = TRUE)
+  fe2 <- sample(1:n_fe2, n_obs, replace = TRUE)
+  fe1_effects <- rnorm(n_fe1 + 1)[fe1]
+  fe2_effects <- rnorm(n_fe2 + 1, sd = 0.5)[fe2]
+  
+  treatment <- rbinom(n_obs, 1, 0.3)
+  x1 <- sample(c(0, 1, 2), n_obs, replace = TRUE)
+  y <- 2.5 * treatment + 1.5 * x1 + fe1_effects + fe2_effects + rnorm(n_obs)
+  
+  pl$DataFrame(
+    y = y, treatment = as.numeric(treatment), x1 = as.numeric(x1),
+    fe1 = fe1, fe2 = fe2
+  )
+}
+
+run_r_benchmark <- function(n_obs, backend) {
+  gc()
+  df <- generate_benchmark_data(n_obs)
+  
+  gc()
+  start <- Sys.time()
+  
+  if (backend == "polars") {
+    result <- leanfe_polars(data = df, formula = "y ~ treatment + x1 | fe1 + fe2", vcov = "iid")
+  } else {
+    result <- leanfe_duckdb(data = df, formula = "y ~ treatment + x1 | fe1 + fe2", vcov = "iid")
+  }
+  
+  elapsed <- as.numeric(difftime(Sys.time(), start, units = "secs"))
+  
+  strategy <- if (!is.null(result$strategy)) result$strategy else if (!is.null(result$n_compressed)) "compress" else "fwl"
+  compression <- result$compression_ratio
+  n_compressed <- result$n_compressed
+  
+  list(
+    time = elapsed,
+    strategy = strategy,
+    compression = compression,
+    n_compressed = n_compressed
+  )
+}
+
+# Run benchmarks
+sizes <- c(100000, 1000000, 10000000, 100000000)
+
+cat("R Comprehensive Benchmark (IID Standard Errors)\n")
+cat(strrep("=", 100), "\n")
+cat(sprintf("%12s %10s %10s %12s %12s %10s\n", "Obs", "Backend", "Time", "Strategy", "Compressed", "Ratio"))
+cat(strrep("-", 100), "\n")
+
+for (n in sizes) {
+  for (backend in c("polars", "duckdb")) {
+    tryCatch({
+      result <- run_r_benchmark(n, backend)
+      
+      compressed_str <- if (!is.null(result$n_compressed)) format(result$n_compressed, big.mark = ",") else "N/A"
+      ratio_str <- if (!is.null(result$compression)) sprintf("%.2f%%", result$compression * 100) else "N/A"
+      
+      cat(sprintf("%12s %10s %9.2fs %12s %12s %10s\n",
+                  format(n, big.mark = ",", scientific = FALSE),
+                  backend,
+                  result$time,
+                  result$strategy,
+                  compressed_str,
+                  ratio_str))
+    }, error = function(e) {
+      cat(sprintf("%12s %10s %10s %s\n",
+                  format(n, big.mark = ",", scientific = FALSE),
+                  backend,
+                  "ERROR",
+                  substr(conditionMessage(e), 1, 40)))
+    })
+  }
+}
+
+cat("\nNote: Strategy 'compress' = YOCO + Sparse Matrix path\n")
+```
+
+
+## Summary Table
+
+The table below summarizes all 4 combinations across all dataset sizes:
+
+| Observations | Language | Backend | Strategy | Why This Strategy |
+|--------------|----------|---------|----------|-------------------|
+| 100K - 100M | Python | Polars | YOCO + Sparse | FE1=500, FE2=100 → total 600 < 20K threshold |
+| 100K - 100M | Python | DuckDB | YOCO + Sparse | Same FE cardinality, same strategy |
+| 100K - 100M | R | Polars | YOCO + Sparse | Same FE cardinality, same strategy |
+| 100K - 100M | R | DuckDB | YOCO + Sparse | Same FE cardinality, same strategy |
+
+## Why YOCO + Sparse is Always Selected Here
+
+With FE1=500 and FE2=100 levels:
+
+- **Max single FE**: 500 ≤ 10,000 threshold ✓
+- **Total FE levels**: 600 ≤ 20,000 threshold ✓
+- **No IV/2SLS**: ✓
+
+All conditions for YOCO are met, so the sparse matrix path is used for all benchmarks.
+
+## FWL Demeaning Benchmark (High-Cardinality FEs)
+
+To demonstrate the FWL path, we use high-cardinality FEs (50K levels) which exceed the YOCO threshold:
+
+```{python}
+#| echo: false
+#| output: true
+
+# High-cardinality FE benchmark (triggers FWL path)
+def generate_high_card_data(n_obs, n_fe1=50000, n_fe2=1000):
+    """Generate data with high-cardinality FEs to trigger FWL."""
+    fe1 = np.random.randint(1, n_fe1 + 1, n_obs)
+    fe2 = np.random.randint(1, n_fe2 + 1, n_obs)
+    
+    treatment = np.random.binomial(1, 0.3, n_obs).astype(float)
+    x1 = np.random.normal(0, 1, n_obs)  # Continuous regressor
+    y = 2.5 * treatment + 1.5 * x1 + np.random.normal(0, 1, n_obs)
+    
+    return pl.DataFrame({
+        "y": y, "treatment": treatment, "x1": x1,
+        "fe1": fe1, "fe2": fe2,
+    })
+
+print("High-Cardinality FE Benchmark (FE1=50K, FE2=1K → triggers FWL)")
+print("=" * 90)
+print(f"{'Obs':>12} {'Backend':>10} {'Time':>10} {'Strategy':>12} {'Iterations':>12}")
+print("-" * 90)
+
+# Only test smaller sizes for FWL (it's slower)
+fwl_sizes = [100_000, 1_000_000]
+
+for n in fwl_sizes:
+    for backend in ["polars", "duckdb"]:
+        try:
+            gc.collect()
+            df = generate_high_card_data(n)
+            
+            gc.collect()
+            start = time.time()
+            result = leanfe(formula="y ~ treatment + x1 | fe1 + fe2", data=df, vcov="iid", backend=backend)
+            elapsed = time.time() - start
+            
+            strategy = result.get("strategy", "fwl" if result.get("iterations", 0) > 0 else "compress")
+            iterations = result.get("iterations", 0)
+            
+            print(f"{n:>12,} {backend:>10} {elapsed:>9.2f}s {strategy:>12} {iterations:>12}")
+        except Exception as e:
+            print(f"{n:>12,} {backend:>10} {'ERROR':>10} {str(e)[:30]}")
+
+print("\nNote: With FE1=50K > 10K threshold, FWL demeaning is selected instead of YOCO")
+```
+
+## Performance Insights
+
+### Python Polars vs DuckDB
+
+- **Polars**: Fastest for in-memory data, higher memory usage
+- **DuckDB**: Slightly slower but constant memory regardless of dataset size
+
+### R Polars vs DuckDB
+
+- **Polars**: Generally faster, uses R's polars bindings
+- **DuckDB**: Better memory efficiency, uses R's DBI interface
+
+### Scaling Behavior
+
+With YOCO compression, runtime scales with **compressed data size**, not original data size. The compression ratio depends on the number of unique (regressor, FE) combinations.
+
+## See Also
+
+- [Benchmark Methodology](methodology.qmd) - Full algorithm description
+- [Clustered SE Benchmarks](cluster-se.qmd) - Performance with cluster-robust SEs
+- [Large Datasets Guide](../guides/large-datasets.qmd) - Working with data larger than RAM

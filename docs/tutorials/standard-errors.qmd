@@ -7,15 +7,31 @@ subtitle: "IID, HC1, and clustered"
 
 This tutorial shows the standard error options available in `leanfe`.
 
-All standard error types use **YOCO compression** from [Wong et al. (2021)](https://arxiv.org/abs/2102.11297) for blazing fast computation. For clustered SEs, leanfe implements Section 5.3.1 using **sparse matrices** for efficient cluster score aggregation.
+All standard error types use **YOCO compression** from [Wong et al. (2021)](https://arxiv.org/abs/2102.11297) combined with **sparse matrices** for blazing fast computation. The sparse matrix approach is used for **all SE types** (IID, HC1, and clustered) — not just clustered SEs.
+
+## YOCO + Sparse Matrix Strategy
+
+When YOCO compression is triggered (low-cardinality FEs, no IV), leanfe:
+
+1. **Compresses data**: GROUP BY (regressors + FEs) → sufficient statistics per group
+2. **Builds sparse design matrix**: FE dummies stored as `scipy.sparse` (Python) or `Matrix::sparseMatrix` (R)
+3. **Solves sparse WLS**: Weighted least squares using sparse matrix operations
+4. **Computes SEs**: Method varies by `vcov` type, but all use the sparse design matrix
+
+This applies to **all 4 backend/language combinations** (Python/Polars, Python/DuckDB, R/Polars, R/DuckDB).
+
+::: {.callout-note}
+## leanfe's Contribution: Sparse Matrices
+The original YOCO paper by Wong et al. (2021) describes the compression strategy and mathematical framework, but focuses on the statistical methodology without addressing how to efficiently represent FE dummy variables in the design matrix. leanfe extends YOCO with **sparse matrices** — a natural choice since FE dummies are ~99% zeros. This provides ~100x memory savings and faster matrix operations while producing **mathematically identical results**. See [Benchmark Methodology](../benchmarks/methodology.qmd#why-sparse-matrices-leanfes-contribution) for the full explanation.
+:::
 
 ## Options
 
-| Type | Syntax | Description | YOCO Support |
-|------|--------|-------------|--------------|
-| IID | `vcov="iid"` | Homoskedastic errors | ✅ |
-| HC1 | `vcov="HC1"` | Heteroskedasticity-robust | ✅ |
-| Clustered | `vcov="cluster"` | Correlation within groups | ✅ (sparse matrix) |
+| Type | Syntax | Description | Sparse Matrix |
+|------|--------|-------------|---------------|
+| IID | `vcov="iid"` | Homoskedastic errors | ✅ Design matrix |
+| HC1 | `vcov="HC1"` | Heteroskedasticity-robust | ✅ Design matrix |
+| Clustered | `vcov="cluster"` | Correlation within groups | ✅ Design matrix + cluster matrix W̃_C |
 
 ## Example Data
 
@@ -75,11 +91,12 @@ for var in ["treatment", "x1"]:
 
 ## Clustered
 
-Clustered SEs use **YOCO + sparse matrix** (Section 5.3.1 of Wong et al. 2021) for efficient computation:
+Clustered SEs use the same **YOCO + sparse design matrix** as IID/HC1, plus an additional **sparse cluster matrix W̃_C** (Section 5.3.1 of Wong et al. 2021) for efficient score aggregation:
 
-1. Within-cluster compression: cluster ID added to GROUP BY
-2. Sparse cluster matrix W̃_C for vectorized score aggregation
-3. No loops over clusters - pure matrix operations
+1. **Within-cluster compression**: cluster ID added to GROUP BY (each compressed record → one cluster)
+2. **Sparse design matrix**: Same as IID/HC1 — FE dummies as sparse matrix
+3. **Sparse cluster matrix W̃_C**: Indicator matrix (G × C) mapping groups to clusters
+4. **Vectorized aggregation**: `cluster_scores = W̃_Cᵀ @ (X × ẽ⁰)` — no loops over clusters!
 
 ```{python}
 #| echo: true
@@ -129,6 +146,26 @@ print(f"  HC1:       {result_hc1['std_errors']['treatment']:.4f}")
 print(f"  Clustered: {result_cluster['std_errors']['treatment']:.4f}")
 print(f"  Two-way:   {result_twoway['std_errors']['treatment']:.4f}")
 ```
+
+## Technical Notes
+
+### When is YOCO + Sparse Matrix Used?
+
+The YOCO compression path with sparse matrices is triggered when:
+
+- `vcov` is "iid", "HC1", or "cluster" (all three!)
+- No IV/2SLS instruments
+- FE cardinality is below thresholds (max single FE ≤ 10,000, total FE levels ≤ 20,000)
+
+When these conditions are met, **all 4 implementations** (Python/Polars, Python/DuckDB, R/Polars, R/DuckDB) use the same sparse matrix strategy.
+
+### Fallback to FWL Demeaning
+
+If FE cardinality is too high or IV is used, leanfe falls back to iterative FWL demeaning (no sparse matrix). This is faster for high-cardinality FEs where the sparse matrix would be huge.
+
+### Implementation Details
+
+See [Benchmark Methodology](../benchmarks/methodology.qmd) for the full algorithm description.
 
 ## Next Steps
 
