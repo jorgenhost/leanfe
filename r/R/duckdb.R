@@ -316,7 +316,7 @@ leanfe_duckdb <- function(
       }
     }
     
-    beta <- solve(XtX, Xty)
+    beta <- .safe_solve(XtX, Xty)
     
     # Compute residuals in SQL
     resid_terms <- sapply(seq_along(x_cols), function(i) {
@@ -339,12 +339,12 @@ leanfe_duckdb <- function(
     if (!is.null(w)) {
       sqrt_w <- sqrt(w)
       X_hat_w <- X_hat * sqrt_w
-      XtX_inv <- solve(crossprod(X_hat_w))
+      XtX_inv <- .safe_solve(crossprod(X_hat_w))
     } else {
-      XtX_inv <- solve(crossprod(X_hat))
+      XtX_inv <- .safe_solve(crossprod(X_hat))
     }
   } else {
-    XtX_inv <- solve(XtX)
+    XtX_inv <- .safe_solve(XtX)
   }
   
   # Standard errors

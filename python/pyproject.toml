@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leanfe"
-version = "0.1.0"
+version = "1.0.0"
 description = "Lean, fast fixed effects regression using Polars and DuckDB"
 readme = "README.md"
 requires-python = ">=3.8"

@@ -42,8 +42,7 @@ NULL
     estimated_compression_ratio = NULL
 ) {
   # Basic checks
-
-vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
+  vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
   if (!vcov_ok || has_instruments) {
     return(FALSE)
   }
@@ -321,37 +320,35 @@ vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
   if (is_sparse) {
     # Sparse weighted least squares
     # Weight the design matrix: diag(wts) @ X
-    Xw <- X * wts  # Matrix package handles this
+    D <- Matrix::Diagonal(x = wts)
+    Xw <- D %*% X
     Yw <- Y * wts
     
     # X'X - convert to dense for solve (p x p is typically small)
     XtX <- as.matrix(Matrix::crossprod(Xw))
     Xty <- as.vector(Matrix::crossprod(Xw, Yw))
-    
-    # Solve using dense methods
-    XtX_inv <- tryCatch({
-      chol2inv(chol(XtX))
-    }, error = function(e) {
-      solve(XtX)
-    })
-    
-    beta <- XtX_inv %*% Xty
   } else {
     # Dense weighted least squares
-    Xw <- X * wts
+    Xw <- sweep(X, 1, wts, "*")
     Yw <- Y * wts
     
     XtX <- crossprod(Xw)
     Xty <- crossprod(Xw, Yw)
-    
-    XtX_inv <- tryCatch({
-      chol2inv(chol(XtX))
-    }, error = function(e) {
-      solve(XtX)
-    })
-    
-    beta <- XtX_inv %*% Xty
   }
+  
+  # Solve using dense methods with fallback to pseudoinverse
+  XtX_inv <- tryCatch({
+    chol2inv(chol(XtX))
+  }, error = function(e) {
+    tryCatch({
+      solve(XtX)
+    }, error = function(e2) {
+      # Fallback to pseudoinverse for singular matrices
+      MASS::ginv(XtX)
+    })
+  })
+  
+  beta <- XtX_inv %*% Xty
   
   list(beta = as.vector(beta), XtX_inv = XtX_inv)
 }
@@ -444,16 +441,22 @@ vcov_ok <- tolower(vcov) %in% c("iid", "hc1", "cluster")
     
   } else if (tolower(vcov) == "hc1") {
     # Meat matrix: X' diag(rss_g) X
+    # Need to multiply each row of X by corresponding rss_g element
     if (is_sparse) {
-      Xw <- X * rss_g
+      # For sparse matrices, use Diagonal for proper row-wise scaling
+      D <- Matrix::Diagonal(x = rss_g)
+      Xw <- D %*% X
       meat <- as.matrix(Matrix::crossprod(X, Xw))
     } else {
-      meat <- crossprod(X, X * rss_g)
+      # For dense matrices, sweep multiplies each row by rss_g
+      Xw <- sweep(X, 1, rss_g, "*")
+      meat <- crossprod(X, Xw)
     }
     vcov_matrix <- XtX_inv %*% meat %*% XtX_inv
     # HC1 adjustment
     adjustment <- n_obs / df_resid
-    se_full <- sqrt(diag(vcov_matrix) * adjustment)
+    # Use pmax to handle numerical precision issues (tiny negative values)
+    se_full <- sqrt(pmax(diag(vcov_matrix) * adjustment, 0))
     
   } else if (tolower(vcov) == "cluster") {
     if (is.null(cluster_ids) || is.null(e0_g)) {

@@ -170,7 +170,4 @@ test_that("IID and HC1 SEs still work with new function signature", {
 })
 
 
-# Run tests if executed directly
-if (sys.nframe() == 0) {
-  test_dir(".", reporter = "summary")
-}
+# Tests complete - all test_that blocks above run automatically

@@ -51,13 +51,13 @@ result <- leanfe(
 ### Python
 
 ```bash
-pip install git+https://github.com/diegogentilepassaro/leanfe.git#subdirectory=python
+pip install git+https://github.com/diegogentilepassaro/leanfe.git#subdirectory=package/python
 ```
 
 ### R
 
 ```r
-remotes::install_github("diegogentilepassaro/leanfe", subdir = "r")
+remotes::install_github("diegogentilepassaro/leanfe", subdir = "package/r")
 ```
 
 ## Documentation
@@ -78,7 +78,7 @@ remotes::install_github("diegogentilepassaro/leanfe", subdir = "r")
 | **Polars** | Maximum speed | Higher memory usage |
 | **DuckDB** | Large datasets | Slightly slower, minimal memory |
 
-**v0.3.0 optimizations:**
+**v1.0.0 optimizations:**
 
 - **Vectorized clustered SEs** — Sparse matrix multiplication instead of loops (~31x faster)
 - **Smart FE ordering** — Low-cardinality FEs processed first for faster convergence (~14% speedup)

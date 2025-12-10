@@ -15,10 +15,11 @@ pip install -e ".[dev]"
 
 ```r
 # Install dependencies
-install.packages(c("polars", "duckdb", "DBI"))
+install.packages(c("polars", "duckdb", "DBI", "Matrix", "MASS"))
 
 # Source files for development
 source("R/common.R")
+source("R/compress.R")
 source("R/polars.R")
 source("R/duckdb.R")
 source("R/leanfe.R")
@@ -40,6 +41,17 @@ cd package/r
 for f in tests/*.R; do Rscript "$f"; done
 ```
 
+### Cross-Language Equivalence
+
+We maintain a cross-language test suite that verifies Python and R produce identical results (within ~1e-14 precision) for all features:
+
+```bash
+cd package
+python tests/test_cross_language_equivalence.py
+```
+
+This test generates data, runs regressions in both languages, and compares coefficients and standard errors. All 7 test scenarios must pass: IID (Polars), IID (DuckDB), HC1, Clustered, Single Treatment, Weighted, and Multiple Treatments.
+
 ## Code Style
 
 ### Python
@@ -60,9 +72,10 @@ for f in tests/*.R; do Rscript "$f"; done
 When adding new features:
 
 1. **Implement in both Python and R** - The packages should maintain feature parity
-2. **Add tests** - Both packages should have equivalent tests
-3. **Update documentation** - Update READMEs, docstrings, and man pages
-4. **Update CHANGELOG** - Document the change
+2. **Add tests** - Both packages should have equivalent tests (9 test files each)
+3. **Verify cross-language equivalence** - Run `pytest tests/test_cross_language_equivalence.py` to ensure Python and R produce identical results
+4. **Update documentation** - Update READMEs, docstrings, and man pages
+5. **Update CHANGELOG** - Document the change
 
 ## Pull Request Process
 
@@ -90,15 +103,17 @@ When reporting issues, please include:
 package/
 ├── python/
 │   └── leanfe/
-│       ├── leanfe.py    # Unified API
+│       ├── leanfe.py        # Unified API
 │       ├── common.py        # Shared utilities
+│       ├── compress.py      # YOCO compression + sparse matrices
 │       ├── polars_impl.py   # Polars backend
 │       └── duckdb_impl.py   # DuckDB backend
 │
 └── r/
     └── R/
-        ├── leanfe.R     # Unified API
+        ├── leanfe.R         # Unified API
         ├── common.R         # Shared utilities
+        ├── compress.R       # YOCO compression + sparse matrices
         ├── polars.R         # Polars backend
         └── duckdb.R         # DuckDB backend
 ```

@@ -5,8 +5,10 @@ library(polars)
 library(duckdb)
 library(DBI)
 source("R/common.R")
+source("R/compress.R")
 source("R/polars.R")
 source("R/duckdb.R")
+source("R/leanfe.R")
 
 # Generate test data
 set.seed(42)

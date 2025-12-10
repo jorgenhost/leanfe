@@ -355,7 +355,7 @@ leanfe_polars <- function(
       XtX <- crossprod(X)
       Xty <- crossprod(X, Y)
     }
-    beta <- solve(XtX, Xty)
+    beta <- .safe_solve(XtX, Xty)
     X_hat <- X
   }
   
@@ -363,9 +363,9 @@ leanfe_polars <- function(
   if (!is.null(w)) {
     sqrt_w <- sqrt(w)
     X_hat_w <- X_hat * sqrt_w
-    XtX_inv <- solve(crossprod(X_hat_w))
+    XtX_inv <- .safe_solve(crossprod(X_hat_w))
   } else {
-    XtX_inv <- solve(crossprod(X_hat))
+    XtX_inv <- .safe_solve(crossprod(X_hat))
   }
   
   # Residuals

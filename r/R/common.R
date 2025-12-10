@@ -2,6 +2,40 @@
 #'
 #' Contains formula parsing, IV estimation, and other shared logic.
 
+
+#' Safe matrix solve with fallback to pseudoinverse
+#'
+#' Attempts to solve using Cholesky decomposition, then regular solve,
+#' then falls back to pseudoinverse for singular/near-singular matrices.
+#'
+#' @param A Square matrix to invert or solve
+#' @param b Optional right-hand side vector/matrix. If NULL, returns inverse of A.
+#' @return Solution to Ax=b or inverse of A
+#' @keywords internal
+.safe_solve <- function(A, b = NULL) {
+  if (is.null(b)) {
+    # Return inverse of A
+    tryCatch({
+      chol2inv(chol(A))
+    }, error = function(e) {
+      tryCatch({
+        solve(A)
+      }, error = function(e2) {
+        MASS::ginv(A)
+      })
+    })
+  } else {
+    # Solve Ax = b
+    tryCatch({
+      solve(A, b)
+    }, error = function(e) {
+      # Fallback: use pseudoinverse
+      MASS::ginv(A) %*% b
+    })
+  }
+}
+
+
 #' Parse i() term with optional reference category
 #'
 #' @param term i() term string like "i(var)" or "i(var, ref=value)"
@@ -116,23 +150,23 @@
     # First stage: X = Z @ gamma
     ZtZ <- crossprod(Z_w)
     ZtX <- crossprod(Z_w, X_w)
-    ZtZ_inv <- solve(ZtZ)
+    ZtZ_inv <- .safe_solve(ZtZ)
     gamma <- ZtZ_inv %*% ZtX
     X_hat <- Z %*% gamma
     
     # Second stage: Y = X_hat @ beta
     X_hat_w <- X_hat * sqrt_w
-    beta <- solve(crossprod(X_hat_w), crossprod(X_hat_w, Y_w))
+    beta <- .safe_solve(crossprod(X_hat_w), crossprod(X_hat_w, Y_w))
   } else {
     # First stage
     ZtZ <- crossprod(Z)
     ZtX <- crossprod(Z, X)
-    ZtZ_inv <- solve(ZtZ)
+    ZtZ_inv <- .safe_solve(ZtZ)
     gamma <- ZtZ_inv %*% ZtX
     X_hat <- Z %*% gamma
     
     # Second stage
-    beta <- solve(crossprod(X_hat), crossprod(X_hat, Y))
+    beta <- .safe_solve(crossprod(X_hat), crossprod(X_hat, Y))
   }
   
   list(beta = beta, X_hat = X_hat)

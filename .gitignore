@@ -51,7 +51,27 @@ docs/_freeze/
 .pytest_cache/
 .coverage
 htmlcov/
+.hypothesis/
 
 # Data files (keep small samples)
 *.parquet
 !docs/_data/*.parquet
+
+# Build artifacts
+*.whl
+*.tar.gz
+MANIFEST
+
+# R build artifacts
+*.Rcheck/
+*.tar.gz
+src/*.o
+src/*.so
+src/*.dll
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log

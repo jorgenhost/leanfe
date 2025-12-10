@@ -1,239 +1,78 @@
-# leanfe: Lean Fixed Effects Regression
+# 🍃💨 leanfe
 
-Lean, fast fixed effects regression using Polars and DuckDB. Optimized for speed and memory efficiency.
+**Lean, Fast Fixed Effects Regression for Python**
 
-## Performance
+[![PyPI](https://img.shields.io/pypi/v/leanfe.svg)](https://pypi.org/project/leanfe/)
+[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-Benchmarked on 12.7M observations with 4 high-dimensional fixed effects:
-
-| Backend | Time (IID) | Time (Clustered) | Memory |
-|---------|------------|------------------|--------|
-| **Polars** | **5.8s** | **5.5s** | **291 MB** |
-| **DuckDB** | 18.4s | 18.2s | **27 MB** |
-| PyFixest | 91.2s | timeout | 6,691 MB |
-
-**Key wins:**
-- **16x faster than PyFixest** with IID standard errors
-- **23x less memory** than PyFixest
-- **DuckDB uses <30 MB** - ideal for datasets larger than RAM
+High-dimensional fixed effects regression that's **fast** when you need speed, and **memory-efficient** when you're working with data larger than RAM.
 
 ## Installation
 
 ```bash
-pip install polars pyarrow numpy
-
-# For DuckDB backend (optional but recommended)
-pip install duckdb
-
-# Install package
-cd python
-pip install -e .
+pip install leanfe
 ```
 
 ## Quick Start
 
 ```python
 from leanfe import leanfe
-import polars as pl
 
-df = pl.read_parquet("data.parquet")
-
-# Default: uses Polars backend (fastest)
-result = leanfe(df, formula="revenue ~ treatment | customer_id + product_id + day")
-
-# For very large datasets: use DuckDB backend (lowest memory)
+# Two-way fixed effects with clustered standard errors
 result = leanfe(
-    df, 
-    formula="revenue ~ treatment | customer_id + product_id + day",
-    backend="duckdb"
+    formula="outcome ~ treatment + controls | unit_id + time_id",
+    data=df,
+    vcov="cluster",
+    cluster_cols=["unit_id"],
+    backend="polars"  # or "duckdb" for large datasets
 )
 
-print(f"Coefficient: {result['coefficients']['treatment']:.4f}")
-print(f"Std Error: {result['std_errors']['treatment']:.4f}")
-print(f"N obs: {result['n_obs']:,}")
-```
-
-## Choosing a Backend
-
-The `backend` parameter controls which implementation is used:
-
-| Backend | Speed | Memory | Best For |
-|---------|-------|--------|----------|
-| `"polars"` (default) | ⚡ Fastest | Moderate | Most use cases, data fits in RAM |
-| `"duckdb"` | Fast | ⚡ Lowest | Very large datasets, memory-constrained |
-
-**Use Polars (default) when:**
-- Speed is the priority
-- Data fits comfortably in memory
-- You need the fastest possible execution
-
-**Use DuckDB when:**
-- Dataset is larger than available RAM
-- Memory is constrained (e.g., shared servers)
-- Reading directly from parquet files without loading into memory
-
-```python
-# Polars: ~6s, ~300 MB (default)
-result = leanfe(df, formula="y ~ x | fe1 + fe2")
-
-# DuckDB: ~18s, ~30 MB
-result = leanfe(df, formula="y ~ x | fe1 + fe2", backend="duckdb")
+print(result)
 ```
 
 ## Features
 
-### Clustered Standard Errors
+- ⚡ **Polars backend** - Blazing fast in-memory computation
+- 💾 **DuckDB backend** - Process datasets larger than RAM
+- 📊 **Full econometrics toolkit** - Clustered SEs, factor variables, IV/2SLS
+- 🚀 **YOCO compression** - Optimal data compression with sparse matrices
+
+## Two Backends
+
+| Backend | Best For | Trade-off |
+|---------|----------|-----------|
+| **Polars** (default) | Maximum speed | Higher memory usage |
+| **DuckDB** | Large datasets | Slightly slower, minimal memory |
 
 ```python
-# One-way clustering
-result = leanfe(
-    df, 
-    formula="y ~ x | fe1 + fe2",
-    vcov="cluster",
-    cluster_cols=["customer_id"]
-)
+# Fast in-memory (default)
+result = leanfe(data=df, formula="y ~ x | fe", backend="polars")
 
-# Multi-way clustering
-result = leanfe(
-    df, 
-    formula="y ~ x | fe1 + fe2",
-    vcov="cluster",
-    cluster_cols=["customer_id", "region"]
-)
+# Memory-efficient (data larger than RAM)
+result = leanfe(data="huge_data.parquet", formula="y ~ x | fe", backend="duckdb")
 ```
 
-### Factor Variables
+## Standard Errors
 
 ```python
-# Expand categorical variable into dummies (first category is reference by default)
-result = leanfe(df, formula="y ~ treatment + i(region) | customer + product")
-# Creates: treatment, region_B, region_C (region_A is reference)
+# IID (default)
+result = leanfe(data=df, formula="y ~ x | fe", vcov="iid")
 
-# Specify custom reference category
-result = leanfe(df, formula="y ~ treatment + i(region, ref=B) | customer + product")
-# Creates: treatment, region_A, region_C (region_B is reference)
+# Heteroskedasticity-robust
+result = leanfe(data=df, formula="y ~ x | fe", vcov="HC1")
+
+# Clustered
+result = leanfe(data=df, formula="y ~ x | fe", vcov="cluster", cluster_cols=["firm_id"])
+
+# Two-way clustered
+result = leanfe(data=df, formula="y ~ x | fe", vcov="cluster", cluster_cols=["firm_id", "year"])
 ```
 
-### Interaction Terms
+## Documentation
 
-```python
-# Heterogeneous treatment effects by region
-result = leanfe(df, formula="y ~ treatment:i(region) | customer + product")
-# Creates: treatment_B, treatment_C (treatment effect for each region vs. reference A)
-
-# With custom reference category
-result = leanfe(df, formula="y ~ treatment:i(region, ref=B) | customer + product")
-# Creates: treatment_A, treatment_C (treatment effect relative to region B)
-```
-
-### Instrumental Variables (IV/2SLS)
-
-```python
-# Two-stage least squares
-result = leanfe(df, formula="y ~ x | fe1 + fe2 | z1 + z2")
-# x is endogenous, z1 and z2 are instruments
-```
-
-### Weighted Regression
-
-```python
-result = leanfe(df, formula="y ~ x | fe1 + fe2", weights="weight_col")
-```
-
-### Difference-in-Differences
-
-```python
-# Classic TWFE DiD
-result = leanfe(
-    df, 
-    formula="y ~ treated_post | state + year",
-    vcov="cluster", 
-    cluster_cols=["state"]
-)
-
-# Event study
-result = leanfe(
-    df,
-    formula="y ~ lead2 + lead1 + lag0 + lag1 + lag2 | state + year", 
-    vcov="cluster", 
-    cluster_cols=["state"]
-)
-```
-
-## API Reference
-
-### leanfe()
-
-```python
-leanfe(
-    data: Union[str, pl.DataFrame],
-    formula: str,
-    vcov: str = "iid",              # "iid", "HC1", or "cluster"
-    cluster_cols: List[str] = None,
-    weights: str = None,
-    demean_tol: float = 1e-3,
-    n_iter: int = 100,
-    sample_frac: float = None,
-    backend: str = "polars"         # "polars" or "duckdb"
-) -> dict
-```
-
-**Parameters:**
-- `data`: Polars DataFrame or path to parquet file
-- `formula`: R-style formula (see syntax below)
-- `vcov`: Variance estimator - "iid", "HC1", or "cluster"
-- `cluster_cols`: Clustering variables for clustered SEs
-- `weights`: Column name for regression weights
-- `backend`: "polars" (fast, default) or "duckdb" (low memory)
-
-**Returns:**
-```python
-{
-    'coefficients': {'treatment': 0.1234, ...},
-    'std_errors': {'treatment': 0.0567, ...},
-    'n_obs': 12722538,
-    'iterations': 6,
-    'vcov_type': 'cluster',
-    'n_clusters': 5040,
-    'is_iv': False,
-    'n_instruments': None
-}
-```
-
-### Backend-Specific Functions
-
-For advanced use cases, you can also import the backend-specific functions directly:
-
-```python
-from leanfe import leanfe_polars, leanfe_duckdb
-
-# These have the same API as leanfe() minus the backend parameter
-result = leanfe_polars(df, formula="y ~ x | fe")
-result = leanfe_duckdb(df, formula="y ~ x | fe")
-```
-
-## Formula Syntax
-
-```
-y ~ x1 + x2 + i(cat_var) + x:i(cat_var) | fe1 + fe2 | z1 + z2
-│   │                                     │            │
-│   └─ Treatment variables                │            └─ Instruments (IV)
-│      - Regular: x1, x2                  │
-│      - Factor: i(cat_var)               └─ Fixed effects
-│      - Interaction: x:i(cat_var)
-└─ Outcome variable
-```
-
-## Algorithm
-
-Uses the Frisch-Waugh-Lovell (FWL) theorem:
-1. Iteratively demean variables within each fixed effect group
-2. Converge when group means < tolerance (typically 4-6 iterations)
-3. OLS on fully demeaned data
-4. Adjust standard errors for absorbed degrees of freedom
-
-**Memory-efficient clustered SEs:** Computes cluster scores via GROUP BY aggregation, avoiding N×K matrix materialization.
+📖 **[Full Documentation](https://diegogentilepassaro.github.io/leanfe/)**
 
 ## License
 
-MIT License
+MIT
