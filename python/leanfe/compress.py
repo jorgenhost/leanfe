@@ -327,7 +327,7 @@ def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: li
     return X_reg, Y, wts, get_fe_values  
 
 def build_design_matrix(
-    compressed_df: pl.DataFrame,
+    compressed_df: pl.DataFrame | DuckDBResult,
     x_cols: list[str],
     fe_cols: list[str],
     backend: str = "polars",
@@ -336,36 +336,23 @@ def build_design_matrix(
     """
     Build design matrix from compressed data with FE dummies.
     
-    Parameters
-    ----------
-    compressed_df : pl.DataFrame
-        Compressed data
-    x_cols : list of str
-        Regressor columns
-    fe_cols : list of str
-        Fixed effect columns
-    backend : str
-        "polars" or "duckdb"
-    use_sparse : bool
-        If True, use sparse matrices for FE dummies (much faster)
-        
     Returns
     -------
     tuple
         (X, Y, wts, all_col_names, n_fe_levels)
-        X is sparse.csr_matrix if use_sparse=True and fe_cols exist
+        all_col_names now includes '(Intercept)' as first element
     """
     # Extract numpy arrays without pandas dependency
     X_reg, Y, wts, get_fe_values = _extract_numpy_arrays(compressed_df, x_cols, backend)
     n_rows = len(Y)
 
-    x_cols = ['(Intercept)'] + list(x_cols)
+    # Create column names with intercept
+    all_x_cols = ['(Intercept)'] + list(x_cols)
     
     if not fe_cols:
-        return X_reg, Y, wts, list(x_cols), 0
+        return X_reg, Y, wts, all_x_cols, 0
     
-    if use_sparse:
-        # Build sparse FE dummies efficiently using COO format
+    if use_sparse:        # Build sparse FE dummies efficiently using COO format
         fe_col_names = []
         n_fe_levels = 0
         col_offset = 0
@@ -411,7 +398,7 @@ def build_design_matrix(
         else:
             X = sparse.csr_matrix(X_reg)
         
-        all_col_names = list(x_cols) + fe_col_names
+        all_col_names = all_x_cols + fe_col_names  # Use all_x_cols instead of x_cols
         return X, Y, wts, all_col_names, n_fe_levels
     
     else:
@@ -437,10 +424,10 @@ def build_design_matrix(
         if fe_dummies:
             X_fe = np.column_stack(fe_dummies)
             X = np.hstack([X_reg, X_fe])
-            all_col_names = list(x_cols) + fe_col_names
+            all_col_names = all_x_cols + fe_col_names  # Use all_x_cols
         else:
             X = X_reg
-            all_col_names = list(x_cols)
+            all_col_names = all_x_cols  # Use all_x_cols
         
         return X, Y, wts, all_col_names, n_fe_levels
 
@@ -526,7 +513,7 @@ def compute_rss_grouped(
     beta : np.ndarray
         Coefficient vector
     backend : str
-        "polars" or "duckdb"
+        "polars" or "duckdbbuild_design_matrix"
         
     Returns
     -------
@@ -712,41 +699,15 @@ def leanfe_compress_polars(
 ) -> dict[str, dict[str, Any] | int | float | str | None]:
     """
     Run compressed regression using Polars backend.
-    
-    For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression).
-    
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input data
-    y_col : str
-        Dependent variable
-    x_cols : list of str
-        Regressors
-    fe_cols : list of str
-        Fixed effects
-    weights : str, optional
-        Weight column
-    vcov : str
-        "iid", "HC1", or "cluster"
-    cluster_col : str, optional
-        Cluster column (required if vcov="cluster")
-    ssc : bool
-        Small sample correction for cluster SEs
-        
-    Returns
-    -------
-    dict
-        Regression results
     """
-    # Compress data (include cluster in grouping for cluster SEs)
+    # Compress data
     compressed, n_obs = compress_polars(
         df, y_col, x_cols, fe_cols, weights, 
         cluster_col=cluster_col if vcov.lower() == "cluster" else None
     )
     n_compressed = len(compressed)
     
-    # Build design matrix
+    # Build design matrix - all_cols now includes '(Intercept)'
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
         compressed, x_cols, fe_cols, backend="polars"
     )
@@ -774,18 +735,26 @@ def leanfe_compress_polars(
             yhat_g = X @ beta
         e0_g = sum_y_g - n_g * yhat_g  # ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ
     
-    # Standard errors
+    # Extract number of x columns INCLUDING intercept
+    k_x = len(x_cols) + 1
+    x_cols_with_intercept = all_cols[:k_x]
+
+
+    # Standard errors - pass x_cols_with_intercept
     se, n_clusters = compute_se_compress(
-        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols,
+        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, 
+        x_cols_with_intercept,  # Now includes '(Intercept)'
         cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
     )
     
-    # Extract coefficients for x_cols only
-    beta_x = beta[:len(x_cols)]
+    # Extract coefficients for x_cols (excluding intercept from results)
+    beta_x = beta[1:k_x]  # Skip intercept
+    se_x = se[1:]  # Skip intercept
+    
     
     return {
         "coefficients": dict(zip(x_cols, beta_x)),
-        "std_errors": dict(zip(x_cols, se)),
+        "std_errors": dict(zip(x_cols, se_x)),
         "n_obs": n_obs,
         "n_compressed": n_compressed,
         "compression_ratio": n_compressed / n_obs,
@@ -798,7 +767,7 @@ def leanfe_compress_polars(
 
 
 def leanfe_compress_duckdb(
-    con,
+    con: DuckDBPyConnection,
     y_col: str,
     x_cols: list[str],
     fe_cols: list[str],
@@ -809,42 +778,15 @@ def leanfe_compress_duckdb(
 ) -> dict[str, dict[str, Any] | int | float | str | None]:
     """
     Run compressed regression using DuckDB backend.
-    
-    For cluster SEs, implements Section 5.3.1 of YOCO paper (within-cluster compression)
-    using sparse matrices for efficient cluster score aggregation.
-    
-    Parameters
-    ----------
-    con : duckdb.Connection
-        DuckDB connection with 'data' table
-    y_col : str
-        Dependent variable
-    x_cols : list of str
-        Regressors
-    fe_cols : list of str
-        Fixed effects
-    weights : str, optional
-        Weight column
-    vcov : str
-        "iid", "HC1", or "cluster"
-    cluster_col : str, optional
-        Cluster column (required if vcov="cluster")
-    ssc : bool
-        Small sample correction for cluster SEs
-        
-    Returns
-    -------
-    dict
-        Regression results
     """
-    # Compress data (include cluster in grouping for cluster SEs)
+    # Compress data
     compressed, n_obs = compress_duckdb(
         con, y_col, x_cols, fe_cols, weights,
         cluster_col=cluster_col if vcov.lower() == "cluster" else None
     )
     n_compressed = len(compressed)
     
-    # Build design matrix
+    # Build design matrix - all_cols now includes '(Intercept)'
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
         compressed, x_cols, fe_cols, backend="duckdb"
     )
@@ -871,30 +813,26 @@ def leanfe_compress_duckdb(
             yhat_g = np.asarray(X @ beta).flatten()
         else:
             yhat_g = X @ beta
-        e0_g = sum_y_g - n_g * yhat_g  # ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ
+        e0_g = sum_y_g - n_g * yhat_g
     
-    # Standard errors
+    # Extract number of x columns INCLUDING intercept
+    k_x = len(x_cols) + 1
+    x_cols_with_intercept = all_cols[:k_x]
+    
+    # Standard errors - pass x_cols_with_intercept
     se, n_clusters = compute_se_compress(
-        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, x_cols,
+        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X,
+        x_cols_with_intercept,  # Now includes '(Intercept)'
         cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
     )
     
-    # Extract coefficients for x_cols only
-    k_x = len(x_cols) + 1  # Original count + 1 for Intercept
-    names_x = all_cols[:k_x]
-    
-    # 2. Pass the updated names to compute_se_compress so SEs align
-    se, n_clusters = compute_se_compress(
-        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, names_x, # Use names_x
-        cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
-    )
-    
-    # 3. Slice the first k_x coefficients
-    beta_x = beta[:k_x]
+    # Extract coefficients for x_cols (excluding intercept from results)
+    beta_x = beta[1:k_x]  # Skip intercept
+    se_x = se[1:]  # Skip intercept
     
     return {
         "coefficients": dict(zip(x_cols, beta_x)),
-        "std_errors": dict(zip(x_cols, se)),
+        "std_errors": dict(zip(x_cols, se_x)),
         "n_obs": n_obs,
         "n_compressed": n_compressed,
         "compression_ratio": n_compressed / n_obs,
