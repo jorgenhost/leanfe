@@ -5,9 +5,8 @@ Optimized for speed using Polars LazyFrame/DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
 import polars as pl
-import polars.selectors as cs
-pl.Config.set_engine_affinity('streaming')
 import numpy as np
+import polars.selectors as cs
 from leanfe.result import LeanFEResult
 from leanfe.common import (
     parse_formula,
@@ -19,10 +18,12 @@ from leanfe.compress import (
     leanfe_compress_polars, 
     estimate_compression_ratio
 )
+pl.Config.set_engine_affinity('streaming')
+
 MAX_FE_LEVELS = 10_000
 
 
-def _expand_factors(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
+def _expand_factors_polars(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
     """
     Expand factor variables into dummy variables, dropping reference category.
     
@@ -39,25 +40,33 @@ def _expand_factors(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
     tuple
         (df, dummy_cols) - DataFrame with dummies added and list of dummy column names
     """
+
+    if not factor_vars:
+        return lf, []
+
+    unique_cat_map = lf.select([
+        pl.col(var).unique().sort().alias(var)
+        for var, _  in factor_vars
+    ]).collect()
+
     dummy_cols = []
     factor_exprs = []
+
     for var, ref in factor_vars:
-        categories = lf.select(pl.col(var).unique().sort()).collect().to_series().to_list()
+        categories = unique_cat_map.select(pl.col(var)).to_series().to_list()
         if ref is None:
-            # Default: drop first category
             ref_cat = categories[0]
         else:
-            # User specified reference - try to match type
             ref_cat = ref
-            # Convert ref to match category type if needed
-            if categories and not isinstance(categories[0], str):
+            if categories and not isinstance(categories[0], type(ref)):
                 try:
-                    ref_cat = type(categories[0])(ref)
+                    ref_cat(categories[0])(ref)
                 except (ValueError, TypeError):
                     pass
+            
             if ref_cat not in categories:
-                raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {categories}")
-        
+                raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {categories}")        
+        # Build expressions for dummy columns
         for cat in categories:
             if cat == ref_cat:
                 continue  # Skip reference category
@@ -65,6 +74,7 @@ def _expand_factors(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
             expr = (pl.col(var) == cat).cast(pl.UInt8).alias(dummy_name)
             factor_exprs.append(expr)
             dummy_cols.append(dummy_name)
+
     if factor_exprs:
         lf = lf.with_columns(
             factor_exprs
@@ -72,7 +82,7 @@ def _expand_factors(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
     return lf, dummy_cols
 
 
-def _expand_interactions(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
+def _expand_interactions_polars(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
     """
     Expand interaction terms: var:i(factor) -> var_cat1, var_cat2, ...
     
@@ -89,17 +99,27 @@ def _expand_interactions(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
     tuple
         (lf, interaction_cols) - LazyFrame with interactions added and list of column names
     """
+    if not interactions:
+        return lf, []
+
+    # Collect all unique categories for all factors in ONE pass
+    unique_factors = list(set(inter[1] for inter in interactions))
+    unique_cat_map = lf.select([
+        pl.col(f).unique().sort().alias(f) 
+        for f in unique_factors
+    ]).collect()
+
     interaction_cols = []
     interaction_exprs = []
+
     for var, factor, ref in interactions:
-        categories = lf.select(pl.col(factor).unique().sort()).collect().to_series().to_list()
+        categories = unique_cat_map.select(pl.col(var)).to_list()
         if ref is None:
             # Default: drop first category
             ref_cat = categories[0]
         else:
-            # User specified reference - try to match type
             ref_cat = ref
-            if categories and not isinstance(categories[0], str):
+            if categories and not isinstance(categories[0], type(ref)):
                 try:
                     ref_cat = type(categories[0])(ref)
                 except (ValueError, TypeError):
@@ -121,9 +141,12 @@ def _expand_interactions(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
     return lf, interaction_cols
 
 
-def _cats_to_int(lf: pl.LazyFrame, fe_cols: list[str]) -> pl.LazyFrame:
+def _cats_to_int(lf: pl.LazyFrame, fe_cols: list[str] | None) -> pl.LazyFrame:
     """If FE cols are coded as pl.Categorical/pl.String, cast to pl.Int for numpy to read."""
-      
+    
+    if fe_cols is None:
+        return lf
+
     fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String, pl.Categorical)).collect_schema().names()
     EXPR = [
         pl.col(col).alias(col).cast(pl.Categorical).to_physical()
@@ -227,7 +250,7 @@ def leanfe_polars(
     
     # Expand interactions
     if interactions:
-        df, interaction_cols = _expand_interactions(lf, interactions)
+        lf, interaction_cols = _expand_interactions_polars(lf, interactions)
         x_cols = x_cols + interaction_cols
     
     # Optimize types (always done for memory efficiency)
@@ -240,7 +263,7 @@ def leanfe_polars(
     
     # Expand factor variables into dummies
     if factor_vars:
-        lf, dummy_cols = _expand_factors(lf, factor_vars)
+        lf, dummy_cols = _expand_factors_polars(lf, factor_vars)
         x_cols = x_cols + dummy_cols
     
     # Check if we should use compression strategy (faster for IID/HC1 without IV)

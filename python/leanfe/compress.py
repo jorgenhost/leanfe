@@ -231,8 +231,7 @@ def estimate_compression_ratio(
 
     if con is not None:
         # If data is a path, we query the file directly; otherwise use 'raw_data' view
-        table_ref = f"read_parquet('{data}')" if isinstance(data, str) else "raw_data"
-        
+        table_ref = 'data'        
         # 1. Total rows
         res = con.execute(f"SELECT COUNT(*)::BIGINT FROM {table_ref}").fetchone()
         if res is None:

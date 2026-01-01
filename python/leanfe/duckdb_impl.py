@@ -21,6 +21,89 @@ from leanfe.compress import (
 )
 MAX_FE_LEVELS = 10_000
 
+def _expand_factors_duckdb(
+    con: duckdb.DuckDBPyConnection, 
+    factor_vars: list[tuple[str, str | None]],
+    table_name: str = 'data',     
+    ) -> list[str]:
+    # 1. Get unique categories for all factors in one go
+    # Using a single query to fetch metadata is faster than one query per column.
+
+    case_parts = []
+    dummy_cols = []
+    
+    for var, ref in factor_vars:
+        # Fetch categories
+        categories = [r[0] for r in con.execute(f"SELECT DISTINCT {var} FROM {table_name} ORDER BY 1").fetchall()]
+        ref_cat = ref if ref is not None else categories[0]
+        
+        for cat in categories:
+            if cat == ref_cat: 
+                continue
+            if isinstance(cat, str):
+                cat_sql = f"'{cat}'"
+            else:
+                cat_sql = str(cat)
+            col_name = f"{var}_{cat}"            # Use CASE statements for bulk expansion
+            case_parts.append(f"CASE WHEN {var} = '{cat_sql}' THEN 1 ELSE 0 END AS {col_name}")
+            dummy_cols.append(col_name)
+            
+    # 2. Re-create the table once
+    if case_parts:
+        con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT *, {', '.join(case_parts)} FROM {table_name}")
+    
+    return dummy_cols
+
+def _expand_interactions_duckdb(
+    con: duckdb.DuckDBPyConnection, 
+    interactions: list[tuple[str, str, str | None]],
+    table_name: str = 'data', 
+    ) -> list[str]:
+    """
+    Optimized DuckDB interaction expansion using a single SQL pass.
+    """
+    if not interactions:
+        return []
+
+    interaction_exprs = []
+    all_new_cols = []
+
+    for var, factor, ref in interactions:
+        # 1. Fetch distinct categories once per factor
+        cats = [r[0] for r in con.execute(
+            f"SELECT DISTINCT {factor} FROM {table_name} ORDER BY {factor}"
+        ).fetchall()]
+        
+        # 2. Determine reference category (logic same as original)
+        if ref is None:
+            ref_cat = cats[0]
+        else:
+            ref_cat = ref
+            if cats and not isinstance(cats[0], str):
+                try: ref_cat = type(cats[0])(ref)
+                except (ValueError, TypeError):
+                    ref_cat = ref        
+        # 3. Build CASE statements for each non-reference category
+        for cat in cats:
+            if cat == ref_cat:
+                continue
+            if isinstance(cat, str):
+                cat_sql = f"'{cat}'"
+            else:
+                cat_sql = str(cat)
+            col_name = f"{var}_{cat}"
+            # Use SQL CASE for the interaction calculation
+            expr = f"CASE WHEN {factor} = '{cat_sql}' THEN {var} ELSE 0 END AS {col_name}"
+            interaction_exprs.append(expr)
+            all_new_cols.append(col_name)
+
+    # 4. Apply all interactions in one single relational operation
+    if interaction_exprs:
+        sql = f"CREATE OR REPLACE TABLE {table_name} AS SELECT *, {', '.join(interaction_exprs)} FROM {table_name}"
+        con.execute(sql)
+
+    return all_new_cols
+
 def leanfe_duckdb(
     data: str | pl.DataFrame | pl.LazyFrame | None,
     y_col: str | None = None,
@@ -110,77 +193,40 @@ def leanfe_duckdb(
     # Register data source
     if isinstance(data, str):
         col_list = ', '.join(needed_cols)
-        con.execute(f"CREATE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
+        con.execute(f"CREATE OR REPLACE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
     elif isinstance(data, pl.DataFrame): 
         df = data.select(needed_cols)
-        con.register("raw_data", df)
+        con.register("data", df)
     elif isinstance(data, pl.LazyFrame):
         df = data.select(needed_cols).collect()
-        con.register('raw_data', df)
+        con.register('data', df)
     else:
         raise ValueError(
             'Please specify either data or con argument'
         )
     # Sample if requested
     if sample_frac is not None:
-        frac_sql =  f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%"
+        frac_sql =  f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%"        
         con.execute(frac_sql)
-
     else:
         con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
-    
     # Handle interactions
     if interactions:
-        for var, factor, ref in interactions:
-            cats = [r[0] for r in con.execute(f"SELECT DISTINCT {factor} FROM data ORDER BY {factor}").fetchall()]
-            # Determine reference category
-            if ref is None:
-                ref_cat = cats[0]  # Default: first category
-            else:
-                # Try to match type
-                ref_cat = ref
-                if cats and not isinstance(cats[0], str):
-                    try:
-                        ref_cat = type(cats[0])(ref)
-                    except (ValueError, TypeError):
-                        pass
-                if ref_cat not in cats:
-                    raise ValueError(f"Reference category '{ref}' not found in {factor}. Available: {cats}")
-            
-            for cat in cats:
-                if cat == ref_cat:
-                    continue  # Skip reference category
-                col_name = f"{var}_{cat}"
-                con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                con.execute(f"UPDATE data SET {col_name} = CASE WHEN {factor} = '{cat}' THEN {var} ELSE 0 END")
-                x_cols.append(col_name)
-    
+        new_cols = _expand_interactions_duckdb(
+            con = con,
+            table_name = 'data',
+            interactions = interactions
+        )
+        x_cols = x_cols + new_cols
+
     # Handle factor variables
     if factor_vars:
-        for var, ref in factor_vars:
-            cats = [r[0] for r in con.execute(f"SELECT DISTINCT {var} FROM data ORDER BY {var}").fetchall()]
-            # Determine reference category
-            if ref is None:
-                ref_cat = cats[0]  # Default: first category
-            else:
-                # Try to match type
-                ref_cat = ref
-                if cats and not isinstance(cats[0], str):
-                    try:
-                        ref_cat = type(cats[0])(ref)
-                    except (ValueError, TypeError):
-                        pass
-                if ref_cat not in cats:
-                    raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {cats}")
-            
-            for cat in cats:
-                if cat == ref_cat:
-                    continue  # Skip reference category
-                col_name = f"{var}_{cat}"
-                con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                con.execute(f"UPDATE data SET {col_name} = CASE WHEN {var} = '{cat}' THEN 1 ELSE 0 END")
-                x_cols.append(col_name)
-    
+        new_cols = _expand_factors_duckdb(
+            con = con,
+            table_name = 'data',
+            factor_vars = factor_vars
+        )
+        x_cols = x_cols + new_cols
     # Check if we should use compression strategy (faster for IID/HC1 without IV)
     # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
     is_iv = len(instruments) > 0
@@ -259,43 +305,65 @@ def leanfe_duckdb(
         
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        
-        # Add demeaned columns
-        for col in cols_to_demean:
-            con.execute(f"ALTER TABLE data ADD COLUMN {col}_dm DOUBLE")
-            con.execute(f"UPDATE data SET {col}_dm = {col}")
-        
+        alter_statements = [f"ALTER TABLE data ADD COLUMN {col}_dm DOUBLE" for col in cols_to_demean]
+        con.execute("; ".join(alter_statements))
+
+        # Initialize demeaned columns in one UPDATE
+        update_cols = ", ".join([f"{col}_dm = {col}" for col in cols_to_demean])
+        con.execute(f"UPDATE data SET {update_cols}")
+
         dm_cols = [f"{col}_dm" for col in cols_to_demean]
         
         # Iterative demeaning
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
                 if weights is not None:
-                    for col in dm_cols:
-                        con.execute(f"""
-                            UPDATE data SET {col} = {col} - (
-                                SELECT SUM(d2.{col} * d2.{weights}) / SUM(d2.{weights})
-                                FROM data d2 WHERE d2.{fe} = data.{fe}
-                            )
-                        """)
+                    mean_cols = ", ".join([f"SUM({col} * {weights}) / SUM({weights}) as mean_{col}" 
+                                        for col in dm_cols])
+                    con.execute(f"""
+                        CREATE OR REPLACE TEMP TABLE fe_means AS
+                        SELECT {fe}, {mean_cols}
+                        FROM data
+                        GROUP BY {fe}
+                    """)
+                    
+                    update_expr = ", ".join([f"{col} = {col} - fe_means.mean_{col}" for col in dm_cols])
+                    con.execute(f"""
+                        UPDATE data 
+                        SET {update_expr}
+                        FROM fe_means 
+                        WHERE data.{fe} = fe_means.{fe}
+                    """)
                 else:
-                    for col in dm_cols:
-                        con.execute(f"""
-                            WITH fe_means AS (SELECT {fe}, AVG({col}) as mean_val FROM data GROUP BY {fe})
-                            UPDATE data SET {col} = data.{col} - fe_means.mean_val
-                            FROM fe_means WHERE data.{fe} = fe_means.{fe}
-                        """)
+                    mean_cols = ", ".join([f"AVG({col}) as mean_{col}" for col in dm_cols])
+                    con.execute(f"""
+                        CREATE OR REPLACE TEMP TABLE fe_means AS
+                        SELECT {fe}, {mean_cols}
+                        FROM data
+                        GROUP BY {fe}
+                    """)
+                    
+                    # Update all columns in one statement
+                    update_expr = ", ".join([f"{col} = {col} - fe_means.mean_{col}" for col in dm_cols])
+                    con.execute(f"""
+                        UPDATE data 
+                        SET {update_expr}
+                        FROM fe_means 
+                        WHERE data.{fe} = fe_means.{fe}
+                    """)
             
             if it >= 3:
-                max_mean = 0
-                for fe in fe_cols:
-                    for col in dm_cols:
-                        result = con.execute(f"SELECT MAX(ABS(avg_val)) FROM (SELECT AVG({col}) as avg_val FROM data GROUP BY {fe})").fetchone()
-                        if result is None:
-                            raise ValueError(f'Could not demean {col}')
-                        result = result[0]
-                        max_mean = max(max_mean, abs(result or 0))
-                if max_mean < demean_tol:
+                check_cols = " UNION ALL ".join([
+                    f"SELECT {fe} as fe_col, '{col}' as dm_col, AVG({col}) as avg_val FROM data GROUP BY {fe}"
+                    for fe in fe_cols for col in dm_cols
+                ])
+                result = con.execute(f"""
+                    SELECT MAX(ABS(avg_val)) FROM ({check_cols})
+                """).fetchone()
+                if result is None:
+                        raise ValueError('Error in iterative demeaning')
+                result = result[0]
+                if abs(result or 0) < demean_tol:
                     break
     
     k = len(x_cols)
@@ -435,9 +503,19 @@ def leanfe_duckdb(
         else:
             raise ValueError(f"Unknown vcov: {vcov}")
 
-    # Let's not kill the users connection, but only drop the view
-    con.execute("DROP VIEW IF EXISTS raw_data")
-    
+    # Let's not kill the users connection, but only drop the views/tables we used
+    def drop_all_objects(con):
+        # 1. Drop all Views first (to avoid dependency issues)
+        views = con.execute("SELECT view_name FROM duckdb_views WHERE NOT internal").fetchall()
+        for (view_name,) in views:
+            con.execute(f'DROP VIEW IF EXISTS "{view_name}"')
+            
+        # 2. Drop all Tables
+        tables = con.execute("SELECT table_name FROM duckdb_tables WHERE NOT internal").fetchall()
+        for (table_name,) in tables:
+            con.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')    
+
+    drop_all_objects(con)
     return LeanFEResult(
         coefficients=dict(zip(x_cols, beta)), 
         std_errors=dict(zip(x_cols, se)),     
