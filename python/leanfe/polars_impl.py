@@ -142,19 +142,20 @@ def _optimize_dtypes(df: pl.DataFrame, fe_cols: list[str]) -> pl.DataFrame:
 
 
 def leanfe_polars(
-    data: Union[str, pl.DataFrame],
-    y_col: Optional[str] = None,
-    x_cols: Optional[List[str]] = None,
-    fe_cols: Optional[List[str]] = None,
-    formula: Optional[str] = None,
-    weights: Optional[str] = None,
-    demean_tol: float = 1e-5,
+    data: str | pl.DataFrame | pl.LazyFrame,
+    y_col: str | None = None,
+    x_cols: list[str] | None = None,
+    fe_cols: list[str] | None = None,
+    formula: str | None = None,
+    strategy: str = 'auto',
+    weights: str | None = None,
+    demean_tol: float = 1e-10,
     max_iter: int = 500,
     vcov: str = "iid",
-    cluster_cols: Optional[List[str]] = None,
+    cluster_cols: list[str] | None = None,
     ssc: bool = False,
-    sample_frac: Optional[float] = None
-) -> dict:
+    sample_frac: float | None = None
+) -> LeanFEResult:
     """
     Fast fixed effects regression using Polars and FWL theorem.
     
@@ -258,16 +259,29 @@ def leanfe_polars(
     # NOTE: A "hybrid" approach (demean high-card FEs, then YOCO on low-card) was tested
     # but is mathematically incorrect. After partial demeaning, Y still has non-zero means
     # within low-card FE groups, so adding dummies doesn't give the same result as full FWL.
-    MAX_FE_LEVELS = 10000
-    n_obs_initial = len(df)
-    use_compress = should_use_compress(
-        vcov, is_iv, fe_cardinality,
-        max_fe_levels=MAX_FE_LEVELS,
-        n_obs=n_obs_initial,
-        n_x_cols=len(x_cols)
-    )
     
-    if use_compress:
+    n_obs_initial = len(df)
+    
+    if strategy == 'auto':
+        est_comp_ratio = estimate_compression_ratio(
+        data = df,
+        x_cols = x_cols,
+        fe_cols = fe_cols
+        )
+        
+        inferred_strategy = determine_strategy(
+            vcov, is_iv, fe_cardinality,
+            max_fe_levels=MAX_FE_LEVELS,
+            n_obs=n_obs_initial,
+            n_x_cols=len(x_cols),
+            estimated_compression_ratio=est_comp_ratio
+        )
+        print(f'Auto strategy: Inferring {inferred_strategy} strategy')
+        strategy = inferred_strategy
+
+        
+    if strategy == 'compress':
+        print('Using compresssion strategy...')
         # Use YOCO compression strategy - much faster for discrete regressors
         # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
         cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
@@ -288,53 +302,55 @@ def leanfe_polars(
         result["formula"] = formula
         result["fe_cols"] = fe_cols
         return result
-    
-    # Fall back to FWL demeaning for cluster SEs or IV
-    # Extract weights if provided
-    if weights is not None:
-        w = df.select(weights).to_numpy().flatten()
-    else:
-        w = None
-    
-    # Drop singletons
-    prev_len = len(df) + 1
-    while len(df) < prev_len:
-        prev_len = len(df)
-        for fe in fe_cols:
-            counts = df.group_by(fe).agg(pl.len().alias("cnt"))
-            df = df.join(counts, on=fe, how="left").filter(pl.col("cnt") > 1).drop("cnt")
-    
-    n_obs = len(df)
-    cols_to_demean = [y_col] + x_cols + instruments
-    
-    # Order FEs by cardinality (low-card first) for faster convergence
-    # Low-cardinality FEs have fewer groups, making GROUP BY operations faster.
-    # Processing them first quickly reduces variation in the data.
-    fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-    
-    # FWL demeaning
-    for it in range(1, max_iter + 1):
-        for fe in fe_cols_ordered:
-            if weights is not None:
-                means = df.group_by(fe).agg([
-                    (pl.col(c) * pl.col(weights)).sum().truediv(pl.col(weights).sum()).alias(f"{c}_mean") 
-                    for c in cols_to_demean
-                ])
-            else:
-                means = df.group_by(fe).agg([pl.col(c).mean().alias(f"{c}_mean") for c in cols_to_demean])
-            
-            df = df.join(means, on=fe, how="left")
-            for c in cols_to_demean:
-                df = df.with_columns((pl.col(c) - pl.col(f"{c}_mean")).alias(c)).drop(f"{c}_mean")
+
+    if strategy == 'alt_proj':
+        print('Using FWL/alternating projections strategy..')
+        # Fall back to FWL demeaning for cluster SEs or IV
+        # Extract weights if provided
+        if weights is not None:
+            w = df.select(weights).to_numpy().flatten()
+        else:
+            w = None
         
-        if it >= 3:
-            max_mean = max(
-                df.group_by(fe).agg(pl.col(y_col).mean().alias("m"))
-                .select(pl.col("m").abs().max()).item()
-                for fe in fe_cols
-            )
-            if max_mean < demean_tol:
-                break
+        # Drop singletons
+        prev_len = len(df) + 1
+        while len(df) < prev_len:
+            prev_len = len(df)
+            for fe in fe_cols:
+                counts = df.group_by(fe).agg(pl.len().alias("cnt"))
+                df = df.join(counts, on=fe, how="left").filter(pl.col("cnt") > 1).drop("cnt")
+        
+        n_obs = len(df)
+        cols_to_demean = [y_col] + x_cols + instruments
+        
+        # Order FEs by cardinality (low-card first) for faster convergence
+        # Low-cardinality FEs have fewer groups, making GROUP BY operations faster.
+        # Processing them first quickly reduces variation in the data.
+        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+        
+        # FWL demeaning
+        for it in range(1, max_iter + 1):
+            for fe in fe_cols_ordered:
+                if weights is not None:
+                    means = df.group_by(fe).agg([
+                        (pl.col(c) * pl.col(weights)).sum().truediv(pl.col(weights).sum()).alias(f"{c}_mean") 
+                        for c in cols_to_demean
+                    ])
+                else:
+                    means = df.group_by(fe).agg([pl.col(c).mean().alias(f"{c}_mean") for c in cols_to_demean])
+                
+                df = df.join(means, on=fe, how="left")
+                for c in cols_to_demean:
+                    df = df.with_columns((pl.col(c) - pl.col(f"{c}_mean")).alias(c)).drop(f"{c}_mean")
+            
+            if it >= 3:
+                max_mean = max(
+                    df.group_by(fe).agg(pl.col(y_col).mean().alias("m"))
+                    .select(pl.col("m").abs().max()).item()
+                    for fe in fe_cols
+                )
+                if max_mean < demean_tol:
+                    break
     
     # Extract X and Y for OLS/IV solve
     X = df.select(x_cols).to_numpy()
@@ -383,7 +399,7 @@ def leanfe_polars(
             cluster_ids = df.select(cluster_cols[0]).to_numpy().flatten()
         else:
             cluster_ids = df.select(
-                pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cluster_cols], separator="_")
+                pl.concat_str([pl.col(c).cast(pl.String) for c in cluster_cols], separator="_")
             ).to_numpy().flatten()
     
     # Compute standard errors

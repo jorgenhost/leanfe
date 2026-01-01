@@ -18,15 +18,15 @@ from scipy.sparse.linalg import spsolve
 from typing import List, Optional, Dict, Tuple
 
 
-def should_use_compress(
+def determine_strategy(
     vcov: str,
     has_instruments: bool,
-    fe_cardinality: Optional[dict] = None,
+    fe_cardinality: dict | None = None,
     max_fe_levels: int = 10000,
-    n_obs: Optional[int] = None,
-    n_x_cols: Optional[int] = None,
-    estimated_compression_ratio: Optional[float] = None
-) -> bool:
+    n_obs: int | None = None,
+    n_x_cols: int | None = None,
+    estimated_compression_ratio: float | None = None,
+) -> str:
     """
     Determine if compression strategy should be used.
     
@@ -66,10 +66,10 @@ def should_use_compress(
     # Basic checks
     vcov_ok = vcov.lower() in ("iid", "hc1", "cluster")
     if not vcov_ok or has_instruments:
-        return False
+        return 'alt_proj'
     
     if fe_cardinality is None:
-        return True  # Default to compression if no info
+        return 'compress'  # Default to compression if no info
     
     # Calculate total FE levels
     total_fe_levels = sum(fe_cardinality.values())
@@ -78,12 +78,12 @@ def should_use_compress(
     # Rule 1: If any single FE is very high-cardinality, use FWL
     # Building a sparse matrix with 100K+ columns is slow
     if max_single_fe > max_fe_levels:
-        return False
+        return 'alt_proj'
     
     # Rule 2: If total FE levels is very high, use FWL
     # Even if no single FE is huge, many medium FEs can add up
     if total_fe_levels > max_fe_levels * 2:
-        return False
+        return 'alt_proj'
     
     # Rule 3: If we have compression ratio estimate, use cost model
     if estimated_compression_ratio is not None and n_obs is not None:
@@ -98,11 +98,13 @@ def should_use_compress(
         fwl_cost = 10 * n_fe * n_obs
         
         # Use YOCO if it's estimated to be faster
-        return yoco_cost < fwl_cost
+        if yoco_cost < fwl_cost:
+            return 'compress'
+        return 'alt_proj' 
     
+
     # Default: use compression for low-cardinality FEs
-    return True
-    return True
+    return 'compress'
 
 
 def compress_polars(
@@ -183,6 +185,44 @@ class DuckDBResult:
         # Return length of first array
         return len(next(iter(self._data.values())))
 
+
+def estimate_compression_ratio(
+    x_cols: list[str],
+    fe_cols: list[str],
+    data: str | pl.DataFrame | None = None,
+    con: DuckDBPyConnection | None = None,
+) -> float | int:
+    """
+    Estimate the compression ratio (n_compressed / n_obs).
+    
+    Ported from dbreg: 
+    Calculates unique groups across (regressors + fixed effects) / total rows.
+    """
+    key_cols = list(set(x_cols + fe_cols))
+    if not key_cols:
+        return 1.0
+
+    if con is not None:
+        # If data is a path, we query the file directly; otherwise use 'raw_data' view
+        table_ref = f"read_parquet('{data}')" if isinstance(data, str) else "raw_data"
+        
+        # 1. Total rows
+        total_n = con.execute(f"SELECT COUNT(*)::BIGINT FROM {table_ref}").fetchone()[0]
+        
+        # 2. Count distinct tuples (compressed size)
+        cols_expr = ", ".join(key_cols)
+        distinct_sql = f"SELECT COUNT(*)::BIGINT FROM (SELECT DISTINCT {cols_expr} FROM {table_ref}) t"
+        n_groups_total = con.execute(distinct_sql).fetchone()[0]
+        
+    else:
+        # Polars Backend
+        df = data if isinstance(data, pl.DataFrame) else pl.read_parquet(data)
+        total_n = len(df)
+        # Unique combinations of all relevant columns
+        n_groups_total = df.select(key_cols).unique().height
+
+    comp_rat = n_groups_total / max(total_n, 1)
+    return comp_rat
 
 def compress_duckdb(
     con,
