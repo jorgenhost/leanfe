@@ -6,9 +6,17 @@ Contains formula parsing, IV estimation, and other shared logic.
 
 import re
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import NamedTuple
+from leanfe.result import LeanFEResult
 
-from .result import LeanFEResult
+
+class FormulaComponents(NamedTuple):
+    y_col: str
+    x_cols: list[str]
+    fe_cols: list[str]
+    factor_vars: list[tuple[str, str | None]]
+    interactions: list[tuple[str, str, str | None]]
+    instruments: list[str]
 
 
 def _parse_i_term(term: str) -> Tuple[str, Optional[str]]:
@@ -34,31 +42,31 @@ def _parse_i_term(term: str) -> Tuple[str, Optional[str]]:
 
 def parse_formula(formula: str) -> Tuple[str, List[str], List[str], List[Tuple[str, Optional[str]]], List[Tuple[str, str, Optional[str]]], List[str]]:
     """
-    Parse R-style formula into components.
-    
-    Supports:
-    - Basic: 'y ~ x1 + x2 | fe1 + fe2'
-    - Factor variables: 'y ~ x1 + i(region) | fe1'
-    - Factor with reference: 'y ~ x1 + i(region, ref=R1) | fe1'
-    - Interactions: 'y ~ x1 + treatment:i(region) | fe1'
-    - Interactions with reference: 'y ~ x1 + treatment:i(region, ref=R1) | fe1'
-    - IV/2SLS: 'y ~ x1 + x2 | fe1 + fe2 | z1 + z2'
-    
-    Parameters
-    ----------
-    formula : str
-        R-style formula string
+        Parse R-style formula into components.
         
-    Returns
-    -------
-    tuple
-        (y_col, x_cols, fe_cols, factor_vars, interactions, instruments)
-        - y_col: dependent variable name
-        - x_cols: list of independent variable names
-        - fe_cols: list of fixed effect column names
-        - factor_vars: list of (var, ref) tuples where ref is None or reference category
-        - interactions: list of (var, factor, ref) tuples for var:i(factor) terms
-        - instruments: list of instrument variable names (for IV)
+        Supports:
+        - Basic: 'y ~ x1 + x2 | fe1 + fe2'
+        - Factor variables: 'y ~ x1 + i(region) | fe1'
+        - Factor with reference: 'y ~ x1 + i(region, ref=R1) | fe1'
+        - Interactions: 'y ~ x1 + treatment:i(region) | fe1'
+        - Interactions with reference: 'y ~ x1 + treatment:i(region, ref=R1) | fe1'
+        - IV/2SLS: 'y ~ x1 + x2 | fe1 + fe2 | z1 + z2'
+        
+        Parameters
+        ----------
+        formula : str
+            R-style formula string
+            
+        Returns
+        -------
+        tuple
+            (y_col, x_cols, fe_cols, factor_vars, interactions, instruments)
+            - y_col: dependent variable name
+            - x_cols: list of independent variable names
+            - fe_cols: list of fixed effect column names
+            - factor_vars: list of (var, ref) tuples where ref is None or reference category
+            - interactions: list of (var, factor, ref) tuples for var:i(factor) terms
+            - instruments: list of instrument variable names (for IV)
     """
     parts = formula.split('|')
     if len(parts) < 2:
@@ -102,9 +110,8 @@ def parse_formula(formula: str) -> Tuple[str, List[str], List[str], List[Tuple[s
     instruments = []
     if len(parts) == 3:
         instruments = [z.strip() for z in parts[2].split('+')]
-    
-    return y_col, x_cols, fe_cols, factor_vars, interactions, instruments
 
+    return FormulaComponents(y_col, x_cols, fe_cols, factor_vars, interactions, instruments)
 
 def iv_2sls(
     Y: np.ndarray, 
