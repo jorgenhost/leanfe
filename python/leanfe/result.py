@@ -5,7 +5,6 @@ Provides a nice formatted table output similar to fixest/statsmodels.
 """
 
 import numpy as np
-from typing import Dict, List, Optional
 from scipy import stats
 
 
@@ -45,21 +44,21 @@ class LeanFEResult:
     
     def __init__(
         self,
-        coefficients: Dict[str, float],
-        std_errors: Dict[str, float],
+        coefficients: dict[str, float],
+        std_errors: dict[str, float],
         n_obs: int,
         iterations: int,
         vcov_type: str,
         is_iv: bool,
-        n_instruments: Optional[int],
-        n_clusters: Optional[int],
-        df_resid: Optional[int] = None,
-        r_squared: Optional[float] = None,
-        r_squared_within: Optional[float] = None,
-        rss: Optional[float] = None,
-        tss: Optional[float] = None,
-        formula: Optional[str] = None,
-        fe_cols: Optional[List[str]] = None
+        n_instruments: int | None,
+        n_clusters: int | None,
+        df_resid: int | None = None,
+        r_squared: float | None = None,
+        r_squared_within: float | None = None,
+        rss: float | None = None,
+        tss: float | None = None,
+        formula: str | None = None,
+        fe_cols: list[str] | None = None
     ):
         self.coefficients = coefficients
         self.std_errors = std_errors
@@ -171,31 +170,31 @@ class LeanFEResult:
             return f"Clustered ({self.n_clusters:,} clusters)"
         return self.vcov_type
     
-    def coef(self, var: Optional[str] = None):
+    def coef(self, var: str | None = None):
         """Get coefficient(s). If var is None, returns all as dict."""
         if var is None:
             return self.coefficients.copy()
         return self.coefficients.get(var)
     
-    def se(self, var: Optional[str] = None):
+    def se(self, var: str | None = None):
         """Get standard error(s). If var is None, returns all as dict."""
         if var is None:
             return self.std_errors.copy()
         return self.std_errors.get(var)
     
-    def tstat(self, var: Optional[str] = None):
+    def tstat(self, var: str | None = None):
         """Get t-statistic(s). If var is None, returns all as dict."""
         if var is None:
             return self.t_stats.copy()
         return self.t_stats.get(var)
     
-    def pvalue(self, var: Optional[str] = None):
+    def pvalue(self, var: str | None = None):
         """Get p-value(s). If var is None, returns all as dict."""
         if var is None:
             return self.p_values.copy()
         return self.p_values.get(var)
     
-    def confint(self, level: float = 0.95) -> Dict[str, tuple]:
+    def confint(self, level: float = 0.95) -> dict[str, tuple]:
         """
         Compute confidence intervals.
         

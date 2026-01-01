@@ -4,18 +4,19 @@ Polars-based fixed effects regression implementation.
 Optimized for speed using Polars DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
-
 import polars as pl
 import numpy as np
-from typing import List, Optional, Union
+import polars.selectors as cs
 
-from .common import (
+from leanfe.common import (
     parse_formula,
     iv_2sls,
     compute_standard_errors,
-    build_result
+    build_result,
+    LeanFEResult
 )
-from .compress import should_use_compress, leanfe_compress_polars
+from leanfe.compress import determine_strategy, leanfe_compress_polars, estimate_compression_ratio
+MAX_FE_LEVELS = 10_000
 
 
 def _expand_factors(df: pl.DataFrame, factor_vars: list[tuple]) -> tuple:

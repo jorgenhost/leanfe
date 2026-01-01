@@ -19,7 +19,7 @@ class FormulaComponents(NamedTuple):
     instruments: list[str]
 
 
-def _parse_i_term(term: str) -> Tuple[str, Optional[str]]:
+def _parse_i_term(term: str) -> tuple[str, str | None]:
     """
     Parse i() term with optional reference category.
     
@@ -40,7 +40,7 @@ def _parse_i_term(term: str) -> Tuple[str, Optional[str]]:
     raise ValueError(f"Invalid i() syntax: {term}. Use i(var) or i(var, ref=value)")
 
 
-def parse_formula(formula: str) -> Tuple[str, List[str], List[str], List[Tuple[str, Optional[str]]], List[Tuple[str, str, Optional[str]]], List[str]]:
+def parse_formula(formula: str) -> FormulaComponents:
     """
         Parse R-style formula into components.
         
@@ -117,8 +117,8 @@ def iv_2sls(
     Y: np.ndarray, 
     X: np.ndarray, 
     Z: np.ndarray, 
-    weights: Optional[np.ndarray] = None
-) -> Tuple[np.ndarray, np.ndarray]:
+    weights: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Two-Stage Least Squares (2SLS) estimation.
     
@@ -180,10 +180,10 @@ def compute_standard_errors(
     df_resid: int,
     vcov: str,
     X: np.ndarray,
-    weights: Optional[np.ndarray] = None,
-    cluster_ids: Optional[np.ndarray] = None,
+    weights: np.ndarray | None = None,
+    cluster_ids: np.ndarray | None = None,
     ssc: bool = False
-) -> Tuple[np.ndarray, Optional[int]]:
+) -> tuple[np.ndarray, int | None]:
     """
     Compute standard errors for OLS/IV coefficients.
     
@@ -276,19 +276,19 @@ def compute_standard_errors(
 
 
 def build_result(
-    x_cols: List[str],
+    x_cols: list[str],
     beta: np.ndarray,
     se: np.ndarray,
     n_obs: int,
     iterations: int,
     vcov: str,
     is_iv: bool,
-    n_instruments: Optional[int],
-    n_clusters: Optional[int],
-    df_resid: Optional[int] = None,
-    r_squared_within: Optional[float] = None,
-    formula: Optional[str] = None,
-    fe_cols: Optional[List[str]] = None
+    n_instruments: int | None,
+    n_clusters: int | None,
+    df_resid: int | None = None,
+    r_squared_within: float | None = None,
+    formula: str | None = None,
+    fe_cols: list[str] | None = None
 ) -> LeanFEResult:
     """
     Build LeanFEResult object.
@@ -316,15 +316,15 @@ def build_result(
 
 # Keep old function for backwards compatibility
 def build_result_dict(
-    x_cols: List[str],
+    x_cols: list[str],
     beta: np.ndarray,
     se: np.ndarray,
     n_obs: int,
     iterations: int,
     vcov: str,
     is_iv: bool,
-    n_instruments: Optional[int],
-    n_clusters: Optional[int]
+    n_instruments: int | None,
+    n_clusters: int | None
 ) -> dict:
     """
     Build standardized result dictionary.

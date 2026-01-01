@@ -8,31 +8,33 @@ Uses YOCO compression automatically for IID/HC1 standard errors.
 import duckdb
 import numpy as np
 import polars as pl
-from typing import List, Optional, Union
 
-from .common import (
+from leanfe.common import (
     parse_formula,
     iv_2sls,
     compute_standard_errors,
-    build_result
+    build_result,
+    LeanFEResult
 )
-from .compress import should_use_compress, leanfe_compress_duckdb
-
+from leanfe.compress import determine_strategy, leanfe_compress_duckdb, estimate_compression_ratio
+MAX_FE_LEVELS = 10_000
 
 def leanfe_duckdb(
-    data: Union[str, pl.DataFrame],
-    y_col: Optional[str] = None,
-    x_cols: Optional[List[str]] = None,
-    fe_cols: Optional[List[str]] = None,
-    formula: Optional[str] = None,
-    weights: Optional[str] = None,
-    demean_tol: float = 1e-5,
+    data: str | pl.DataFrame | pl.LazyFrame | None,
+    y_col: str | None = None,
+    x_cols: list[str] | None = None,
+    fe_cols: list[str] | None = None,
+    formula: str | None = None,
+    strategy: str = 'auto',
+    weights: str | None = None,
+    demean_tol: float = 1e-8,
     max_iter: int = 500,
     vcov: str = "iid",
-    cluster_cols: Optional[List[str]] = None,
+    cluster_cols: list[str] | None = None,
     ssc: bool = False,
-    sample_frac: Optional[float] = None
-) -> dict:
+    sample_frac: float | None = None,
+    con: duckdb.DuckDBPyConnection | None = None
+) -> LeanFEResult:
     """
     Fixed effects regression using DuckDB with optimized memory usage.
     

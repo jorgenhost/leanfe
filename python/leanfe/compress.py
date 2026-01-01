@@ -14,8 +14,9 @@ Used automatically when vcov is "iid" or "HC1" (not cluster) and no IV.
 import numpy as np
 import polars as pl
 from scipy import sparse
-from scipy.sparse.linalg import spsolve
-from typing import List, Optional, Dict, Tuple
+from duckdb import DuckDBPyConnection
+# from scipy.sparse.linalg import spsolve
+from typing import Any, Callable
 
 
 def determine_strategy(
@@ -110,11 +111,11 @@ def determine_strategy(
 def compress_polars(
     df: pl.DataFrame,
     y_col: str,
-    x_cols: List[str],
-    fe_cols: List[str],
-    weights: Optional[str] = None,
-    cluster_col: Optional[str] = None
-) -> Tuple[pl.DataFrame, int]:
+    x_cols: list[str],
+    fe_cols: list[str],
+    weights: str | None = None,
+    cluster_col: str | None = None
+) -> tuple[pl.DataFrame, int]:
     """
     Compress data using GROUP BY on regressors + fixed effects.
     
@@ -133,7 +134,7 @@ def compress_polars(
         Fixed effect columns
     weights : str, optional
         Weight column name
-    cluster_col : str, optional
+    cluster_col : str, optionalestimate_compression_ratio
         Cluster column for within-cluster compression
         
     Returns
@@ -175,7 +176,7 @@ def compress_polars(
 
 class DuckDBResult:
     """Wrapper for DuckDB numpy result to provide dict-like access."""
-    def __init__(self, data: Dict[str, np.ndarray]):
+    def __init__(self, data: dict[str, np.ndarray]):
         self._data = data
     
     def __getitem__(self, key: str) -> np.ndarray:
@@ -328,19 +329,19 @@ def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: li
 
 
 def build_design_matrix(
-    compressed_df,
-    x_cols: List[str],
-    fe_cols: List[str],
+    compressed_df: pl.DataFrame,
+    x_cols: list[str],
+    fe_cols: list[str],
     backend: str = "polars",
     use_sparse: bool = True
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], int]:
     """
     Build design matrix from compressed data with FE dummies.
     
     Parameters
     ----------
-    compressed_df : DataFrame
-        Compressed data (polars or pandas)
+    compressed_df : pl.DataFrame
+        Compressed data
     x_cols : list of str
         Regressor columns
     fe_cols : list of str
@@ -448,7 +449,7 @@ def solve_wls(
     X,  # np.ndarray or sparse matrix
     Y: np.ndarray,
     wts: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Solve weighted least squares.
     
@@ -510,7 +511,7 @@ def compute_rss_grouped(
     X,  # np.ndarray or sparse matrix
     beta: np.ndarray,
     backend: str = "polars"
-) -> Tuple[float, np.ndarray]:
+) -> tuple[float, np.ndarray]:
     """
     Compute RSS from sufficient statistics.
     
@@ -555,7 +556,7 @@ def compute_rss_grouped(
     return rss_total, rss_g
 
 
-def _build_sparse_cluster_matrix(cluster_ids: np.ndarray) -> Tuple[sparse.csr_matrix, int]:
+def _build_sparse_cluster_matrix(cluster_ids: np.ndarray) -> tuple[sparse.csr_matrix, int]:
     """
     Build sparse cluster indicator matrix W̃_C from Section 5.3.1.
     
@@ -591,11 +592,11 @@ def compute_se_compress(
     df_resid: int,
     vcov: str,
     X,  # np.ndarray or sparse matrix
-    x_cols: List[str],
-    cluster_ids: Optional[np.ndarray] = None,
-    e0_g: Optional[np.ndarray] = None,
+    x_cols: list[str],
+    cluster_ids: np.ndarray | None = None,
+    e0_g: np.ndarray | None = None,
     ssc: bool = False
-) -> Tuple[np.ndarray, Optional[int]]:
+) -> tuple[np.ndarray, int | None]:
     """
     Compute standard errors from compressed data.
     
@@ -702,13 +703,13 @@ def compute_se_compress(
 def leanfe_compress_polars(
     df: pl.DataFrame,
     y_col: str,
-    x_cols: List[str],
-    fe_cols: List[str],
-    weights: Optional[str] = None,
+    x_cols: list[str],
+    fe_cols: list[str],
+    weights: str | None = None,
     vcov: str = "iid",
-    cluster_col: Optional[str] = None,
+    cluster_col: str | None = None,
     ssc: bool = False
-) -> Dict:
+) -> dict[str, dict[str, Any] | int | float | str | None]:
     """
     Run compressed regression using Polars backend.
     
@@ -799,13 +800,13 @@ def leanfe_compress_polars(
 def leanfe_compress_duckdb(
     con,
     y_col: str,
-    x_cols: List[str],
-    fe_cols: List[str],
-    weights: Optional[str] = None,
+    x_cols: list[str],
+    fe_cols: list[str],
+    weights: str | None = None,
     vcov: str = "iid",
-    cluster_col: Optional[str] = None,
+    cluster_col: str | None = None,
     ssc: bool = False
-) -> Dict:
+) -> dict[str, dict[str, Any] | int | float | str | None]:
     """
     Run compressed regression using DuckDB backend.
     
