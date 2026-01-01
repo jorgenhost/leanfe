@@ -298,26 +298,33 @@ def compress_duckdb(
     return compressed, n_obs_original
 
 
-def _extract_numpy_arrays(compressed_df, x_cols: List[str], backend: str):
+def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: list[str], backend: str) -> tuple[
+    np.ndarray, 
+    np.ndarray, 
+    np.ndarray, 
+    Callable[[str | list[str]], np.ndarray]
+    ]:       # get_fe_values function:
     """Extract numpy arrays from compressed dataframe without pandas dependency."""
     if backend == "polars":
         # Use Polars native to_numpy() - no pandas needed
-        X_reg = np.column_stack([compressed_df[col].to_numpy() for col in x_cols])
-        Y = compressed_df["_mean_y"].to_numpy()
-        wts = compressed_df["_wts"].to_numpy()
+        X_reg = compressed_df.select(pl.col(x_cols)).to_numpy()
+        Y = compressed_df.select(pl.col("_mean_y")).to_numpy().flatten()
+        wts = compressed_df.select(pl.col("_wts")).to_numpy().flatten()
         
-        def get_fe_values(fe):
-            return compressed_df[fe].to_numpy()
+        def get_fe_values(fe: str | list[str]):
+            if isinstance(fe, str):
+                return compressed_df.select(fe).to_numpy().flatten()
+            return compressed_df.select(fe).to_numpy()
     else:
         # DuckDB returns DuckDBResult (dict-like with numpy arrays)
         X_reg = np.column_stack([compressed_df[col] for col in x_cols])
         Y = compressed_df["_mean_y"]
         wts = compressed_df["_wts"]
         
-        def get_fe_values(fe):
+        def get_fe_values(fe: str | list[str]):
             return compressed_df[fe]
     
-    return X_reg, Y, wts, get_fe_values
+    return X_reg, Y, wts, get_fe_values  
 
 
 def build_design_matrix(
