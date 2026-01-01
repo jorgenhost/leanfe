@@ -244,7 +244,7 @@ def leanfe_duckdb(
         return result
 
     if strategy == 'alt_proj':
-        print('Using FWL/alternating projections strategy due to high FE dimensionality...')
+        print('Using FWL/alternating projections strategy...')
         # Fall back to FWL demeaning for cluster SEs or IV
         # Drop singletons
         for fe in fe_cols:
@@ -325,17 +325,18 @@ def leanfe_duckdb(
         for i, col_i in enumerate(x_cols):
             col_i_dm = f"{col_i}_dm"
             query_t_y = f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data"
-            Xty[i] = con.execute(query_t_y).fetchone()
-            if Xty[i]:
+            res_t_y = con.execute(query_t_y).fetchone()
+            if res_t_y is None:
                 raise ValueError(f'Could not compute SUM({col_i_dm} * {y_col}_dm)')
+            Xty[i] = res_t_y[0]
             for j in range(i, k):
                 col_j_dm = f"{x_cols[j]}_dm"
                 col_j_dm_query = f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data"
                 val_j_dm = con.execute(col_j_dm_query).fetchone()
                 if val_j_dm is None:
                     raise ValueError(f'Could not compute {col_j_dm_query}')
-                XtX[i, j] = val_j_dm
-                XtX[j, i] = val_j_dm
+                XtX[i, j] = val_j_dm[0]
+                XtX[j, i] = val_j_dm[0]
         
         beta = np.linalg.solve(XtX, Xty)
         

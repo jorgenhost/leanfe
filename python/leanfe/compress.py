@@ -492,12 +492,11 @@ def solve_wls(
     tuple
         (beta, XtX_inv)
     """
-    is_sparse = sparse.issparse(X)
-    
-    if is_sparse:
+        
+    if isinstance(X, sparse.csr_matrix):
         # Sparse weighted least squares
         # Weight the design matrix: diag(wts) @ X
-        Xw = X * wts[:, np.newaxis]
+        Xw = X.multiply(wts[:, np.newaxis])
         Yw = Y * wts
         
         # X'X is dense (p x p is typically small)
