@@ -4,19 +4,21 @@ DuckDB-based fixed effects regression implementation.
 Optimized for memory efficiency using in-database operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
-from numba import none
-
 import duckdb
 import numpy as np
 import polars as pl
 
+from leanfe.result import LeanFEResult
 from leanfe.common import (
     parse_formula,
     iv_2sls,
     compute_standard_errors,
-    LeanFEResult
 )
-from leanfe.compress import determine_strategy, leanfe_compress_duckdb, estimate_compression_ratio
+from leanfe.compress import (
+    determine_strategy,
+    leanfe_compress_duckdb, 
+    estimate_compression_ratio
+)
 MAX_FE_LEVELS = 10_000
 
 def leanfe_duckdb(

@@ -5,18 +5,20 @@ Optimized for speed using Polars LazyFrame/DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
 import polars as pl
+import polars.selectors as cs
 pl.Config.set_engine_affinity('streaming')
 import numpy as np
-import polars.selectors as cs
-
+from leanfe.result import LeanFEResult
 from leanfe.common import (
     parse_formula,
     iv_2sls,
     compute_standard_errors,
-    build_result,
-    LeanFEResult
 )
-from leanfe.compress import determine_strategy, leanfe_compress_polars, estimate_compression_ratio
+from leanfe.compress import (
+    determine_strategy,
+    leanfe_compress_polars, 
+    estimate_compression_ratio
+)
 MAX_FE_LEVELS = 10_000
 
 
@@ -416,18 +418,16 @@ def leanfe_polars(
     tss = np.sum((Y - np.mean(Y))**2)
     r_squared_within = 1 - rss / tss if tss > 0 else None
     
-    return build_result(
-        x_cols=x_cols,
-        beta=beta,
-        se=se,
+    return LeanFEResult(
+        coefficients=dict(zip(x_cols, beta)), 
+        std_errors=dict(zip(x_cols, se)),     
         n_obs=n_obs,
         iterations=it,
-        vcov=vcov,
+        vcov_type=vcov,                       
         is_iv=is_iv,
         n_instruments=len(instruments) if is_iv else None,
         n_clusters=n_clusters,
         df_resid=df_resid,
-        r_squared_within=r_squared_within,
         formula=formula,
         fe_cols=fe_cols
     )

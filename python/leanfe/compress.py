@@ -10,7 +10,7 @@ least squares on the compressed data.
 
 Used automatically when vcov is "iid" or "HC1" (not cluster) and no IV.
 """
-from leanfe import LeanFEResult
+from leanfe.result import LeanFEResult
 
 import numpy as np
 import polars as pl
