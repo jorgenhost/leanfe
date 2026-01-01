@@ -1,10 +1,11 @@
 """
 Polars-based fixed effects regression implementation.
 
-Optimized for speed using Polars DataFrame operations.
+Optimized for speed using Polars LazyFrame/DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
 import polars as pl
+pl.Config.set_engine_affinity('streaming')
 import numpy as np
 import polars.selectors as cs
 
@@ -19,7 +20,7 @@ from leanfe.compress import determine_strategy, leanfe_compress_polars, estimate
 MAX_FE_LEVELS = 10_000
 
 
-def _expand_factors(df: pl.DataFrame, factor_vars: list[tuple]) -> tuple:
+def _expand_factors(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
     """
     Expand factor variables into dummy variables, dropping reference category.
     
@@ -37,9 +38,9 @@ def _expand_factors(df: pl.DataFrame, factor_vars: list[tuple]) -> tuple:
         (df, dummy_cols) - DataFrame with dummies added and list of dummy column names
     """
     dummy_cols = []
-    expr_list = []
+    factor_exprs = []
     for var, ref in factor_vars:
-        categories = df.select(pl.col(var).unique().sort()).to_series().to_list()
+        categories = lf.select(pl.col(var).unique().sort()).collect().to_series().to_list()
         if ref is None:
             # Default: drop first category
             ref_cat = categories[0]
@@ -60,23 +61,23 @@ def _expand_factors(df: pl.DataFrame, factor_vars: list[tuple]) -> tuple:
                 continue  # Skip reference category
             dummy_name = f"{var}_{cat}"
             expr = (pl.col(var) == cat).cast(pl.UInt8).alias(dummy_name)
-            expr_list.append(expr)
+            factor_exprs.append(expr)
             dummy_cols.append(dummy_name)
-    if expr_list:
-        df = df.with_columns(
-            expr_list
+    if factor_exprs:
+        lf = lf.with_columns(
+            factor_exprs
         )
-    return df, dummy_cols
+    return lf, dummy_cols
 
 
-def _expand_interactions(df: pl.DataFrame, interactions: list[tuple]) -> tuple:
+def _expand_interactions(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
     """
     Expand interaction terms: var:i(factor) -> var_cat1, var_cat2, ...
     
     Parameters
     ----------
-    df : pl.DataFrame
-        Input DataFrame
+    lf : pl.LazyFrame
+        Input LazyFrame
     interactions : list of tuples
         List of (var, factor, ref) tuples. ref is None for first category,
         or a specific value to use as reference.
@@ -84,12 +85,12 @@ def _expand_interactions(df: pl.DataFrame, interactions: list[tuple]) -> tuple:
     Returns
     -------
     tuple
-        (df, interaction_cols) - DataFrame with interactions added and list of column names
+        (lf, interaction_cols) - LazyFrame with interactions added and list of column names
     """
     interaction_cols = []
-    expr_list = []
+    interaction_exprs = []
     for var, factor, ref in interactions:
-        categories = df.select(pl.col(factor).unique().sort()).to_series().to_list()
+        categories = lf.select(pl.col(factor).unique().sort()).collect().to_series().to_list()
         if ref is None:
             # Default: drop first category
             ref_cat = categories[0]
@@ -109,37 +110,29 @@ def _expand_interactions(df: pl.DataFrame, interactions: list[tuple]) -> tuple:
                 continue  # Skip reference category
             col_name = f"{var}_{cat}"
             expr = (pl.col(var) * (pl.col(factor) == cat)).cast(pl.Float64).alias(col_name)
-            expr_list.append(expr)
+            interaction_exprs.append(expr)
             interaction_cols.append(col_name)
-    if expr_list:
-        df = df.with_columns(
-            expr_list
+    if interaction_exprs:
+        lf = lf.with_columns(
+            interaction_exprs
         )
-    return df, interaction_cols
+    return lf, interaction_cols
 
 
-def _optimize_dtypes(df: pl.DataFrame, fe_cols: list[str]) -> pl.DataFrame:
-    """Optimize column types: downcast integers, categorize fixed effects."""
-    
-    lf = df.lazy()
-    
-    int_cols = lf.select(cs.integer()).collect_schema().names()
-    fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String)).collect_schema().names()
+def _cats_to_int(lf: pl.LazyFrame, fe_cols: list[str]) -> pl.LazyFrame:
+    """If FE cols are coded as pl.Categorical/pl.String, cast to pl.Int for numpy to read."""
+      
+    fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String, pl.Categorical)).collect_schema().names()
     EXPR = [
-        pl.col(col).alias(col).cast(pl.Categorical)
+        pl.col(col).alias(col).cast(pl.Categorical).to_physical()
         for col in fe_cols_cast
     ]
 
-    df = df.with_columns(
+    lf = lf.with_columns(
         EXPR
     )
 
-    for col in int_cols:
-        s = df.select(pl.col(col)).to_series().shrink_dtype()
-        df = df.with_columns(
-            s.alias(col)
-        )
-    return df
+    return lf
 
 
 def leanfe_polars(
@@ -162,8 +155,8 @@ def leanfe_polars(
     
     Parameters
     ----------
-    data : str or polars.DataFrame
-        Input data: either DataFrame or path to Parquet file
+    data : str, pl.LazyFrame or pl.DataFrame
+        Input data: either LazyFrame/DataFrame or path to Parquet file
     y_col : str, optional
         Dependent variable column name (optional if formula provided)
     x_cols : list of str, optional
@@ -221,39 +214,36 @@ def leanfe_polars(
     
     # Load data
     if isinstance(data, str):
-        df = pl.scan_parquet(data).select(needed_cols).collect()
+        lf = pl.scan_parquet(data).select(needed_cols)
     elif isinstance(data, pl.LazyFrame):
-        df = data.select(needed_cols).collect()
+        lf = data.select(needed_cols)
     else:
-        df = data.select(needed_cols)
+        lf = data.select(needed_cols).lazy()
     
     # Make x_cols mutable
     x_cols = list(x_cols)
     
     # Expand interactions
     if interactions:
-        df, interaction_cols = _expand_interactions(df, interactions)
+        df, interaction_cols = _expand_interactions(lf, interactions)
         x_cols = x_cols + interaction_cols
     
     # Optimize types (always done for memory efficiency)
     factor_var_names = [var for var, ref in factor_vars]
-    df = _optimize_dtypes(df, fe_cols + factor_var_names)
+    lf = _cats_to_int(lf, fe_cols + factor_var_names)
     
     # Sample data if requested
     if sample_frac is not None:
-        df = df.sample(fraction=sample_frac, seed=42)
+        lf = lf.collect().sample(fraction=sample_frac, seed=42).lazy()
     
     # Expand factor variables into dummies
     if factor_vars:
-        df, dummy_cols = _expand_factors(df, factor_vars)
+        lf, dummy_cols = _expand_factors(lf, factor_vars)
         x_cols = x_cols + dummy_cols
     
     # Check if we should use compression strategy (faster for IID/HC1 without IV)
     # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
     is_iv = len(instruments) > 0
-    
-    # Compute FE cardinality to decide strategy
-    fe_cardinality = {fe: df.select(pl.col(fe).n_unique()).item() for fe in fe_cols}
     
     # Strategy selection based on cost estimation:
     # - YOCO compression: fast when good compression ratio AND low total FE levels
@@ -262,12 +252,15 @@ def leanfe_polars(
     # NOTE: A "hybrid" approach (demean high-card FEs, then YOCO on low-card) was tested
     # but is mathematically incorrect. After partial demeaning, Y still has non-zero means
     # within low-card FE groups, so adding dummies doesn't give the same result as full FWL.
-    
-    n_obs_initial = len(df)
-    
+        
     if strategy == 'auto':
+
+        # Compute FE cardinality to decide strategy
+        fe_cardinality = {fe: lf.select(pl.col(fe).n_unique()).collect().item() for fe in fe_cols}
+        n_obs_initial = lf.select(pl.len()).collect().item()
+
         est_comp_ratio = estimate_compression_ratio(
-        data = df,
+        data = lf,
         x_cols = x_cols,
         fe_cols = fe_cols
         )
@@ -287,9 +280,10 @@ def leanfe_polars(
         print('Using compresssion strategy...')
         # Use YOCO compression strategy - much faster for discrete regressors
         # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
+
         cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
         result = leanfe_compress_polars(
-            df=df,
+            lf=lf,
             y_col=y_col,
             x_cols=x_cols,
             fe_cols=fe_cols,
@@ -298,12 +292,10 @@ def leanfe_polars(
             cluster_col=cluster_col,
             ssc=ssc
         )
-        # Add missing fields for compatibility
-        result["iterations"] = 0
-        result["is_iv"] = False
-        result["n_instruments"] = None
-        result["formula"] = formula
-        result["fe_cols"] = fe_cols
+        # Update attributes directly
+        result.formula = formula
+        result.fe_cols = fe_cols
+        
         return result
 
     if strategy == 'alt_proj':
@@ -311,18 +303,19 @@ def leanfe_polars(
         # Fall back to FWL demeaning for cluster SEs or IV
         # Extract weights if provided
         if weights is not None:
-            w = df.select(weights).to_numpy().flatten()
+            w = lf.select(weights).collect().to_numpy().flatten()
         else:
             w = None
         
         # Drop singletons
+        df = lf.collect()
+
         prev_len = len(df) + 1
         while len(df) < prev_len:
             prev_len = len(df)
             for fe in fe_cols:
-                counts = df.group_by(fe).agg(pl.len().alias("cnt"))
-                df = df.join(counts, on=fe, how="left").filter(pl.col("cnt") > 1).drop("cnt")
-        
+                df = df.filter(pl.len().over(fe) > 1)
+                
         n_obs = len(df)
         cols_to_demean = [y_col] + x_cols + instruments
         

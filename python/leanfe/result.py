@@ -6,7 +6,7 @@ Provides a nice formatted table output similar to fixest/statsmodels.
 
 import numpy as np
 from scipy import stats
-
+from typing import Any
 
 class LeanFEResult:
     """
@@ -47,18 +47,19 @@ class LeanFEResult:
         coefficients: dict[str, float],
         std_errors: dict[str, float],
         n_obs: int,
-        iterations: int,
-        vcov_type: str,
-        is_iv: bool,
-        n_instruments: int | None,
-        n_clusters: int | None,
+        vcov_type: str,            
+        iterations: int = 0,
+        n_compressed: int | None = None,       
+        is_iv: bool = False,       
+        n_instruments: int | None = None,
+        n_clusters: int | None = None,
         df_resid: int | None = None,
         r_squared: float | None = None,
         r_squared_within: float | None = None,
         rss: float | None = None,
         tss: float | None = None,
         formula: str | None = None,
-        fe_cols: list[str] | None = None
+        fe_cols: list[str] | dict[str, Any] | None = None
     ):
         self.coefficients = coefficients
         self.std_errors = std_errors

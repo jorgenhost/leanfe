@@ -10,20 +10,20 @@ least squares on the compressed data.
 
 Used automatically when vcov is "iid" or "HC1" (not cluster) and no IV.
 """
+from leanfe import LeanFEResult
 
 import numpy as np
 import polars as pl
 from scipy import sparse
 from duckdb import DuckDBPyConnection
-# from scipy.sparse.linalg import spsolve
-from typing import Any, Callable
-
+from typing import Any, Callable, TypeAlias
+ArrayLike: TypeAlias = np.ndarray | sparse.sparray | sparse.csr_matrix
 
 def determine_strategy(
     vcov: str,
     has_instruments: bool,
-    fe_cardinality: dict | None = None,
-    max_fe_levels: int = 10000,
+    fe_cardinality: dict[str, int] | None = None,
+    max_fe_levels: int = 10_000,
     n_obs: int | None = None,
     n_x_cols: int | None = None,
     estimated_compression_ratio: float | None = None,
@@ -49,7 +49,7 @@ def determine_strategy(
         Whether IV/2SLS is being used
     fe_cardinality : dict, optional
         Dictionary mapping FE column names to their cardinality.
-    max_fe_levels : int, default 10000
+    max_fe_levels : int, default 10_000
         Maximum FE cardinality to allow compression.
     n_obs : int, optional
         Number of observations (for cost estimation)
@@ -109,7 +109,7 @@ def determine_strategy(
 
 
 def compress_polars(
-    df: pl.DataFrame,
+    lf: pl.LazyFrame,
     y_col: str,
     x_cols: list[str],
     fe_cols: list[str],
@@ -124,7 +124,7 @@ def compress_polars(
     
     Parameters
     ----------
-    df : pl.DataFrame
+    lf : pl.LazyFrame
         Input data
     y_col : str
         Dependent variable column
@@ -147,7 +147,7 @@ def compress_polars(
     if cluster_col is not None and cluster_col not in group_cols:
         group_cols = group_cols + [cluster_col]
     
-    n_obs_original = len(df)
+    n_obs_original = lf.select(pl.len()).collect().item()
     
     if weights is not None:
         # Weighted compression
@@ -163,7 +163,7 @@ def compress_polars(
             pl.col(y_col).pow(2).sum().alias("_sum_y_sq"),
         ]
     
-    compressed = df.group_by(group_cols).agg(agg_exprs)
+    compressed = lf.group_by(group_cols).agg(agg_exprs).collect()
     
     # Add mean_y and sqrt weights for WLS
     compressed = compressed.with_columns([
@@ -176,7 +176,7 @@ def compress_polars(
 
 class DuckDBResult:
     """Wrapper for DuckDB numpy result to provide dict-like access."""
-    def __init__(self, data: dict[str, np.ndarray]):
+    def __init__(self, data: dict[str, Any]):
         self._data = data
     
     def __getitem__(self, key: str) -> np.ndarray:
@@ -190,15 +190,41 @@ class DuckDBResult:
 def estimate_compression_ratio(
     x_cols: list[str],
     fe_cols: list[str],
-    data: str | pl.DataFrame | None = None,
+    data: str | pl.LazyFrame | None = None,
     con: DuckDBPyConnection | None = None,
-) -> float | int:
+) -> float:
     """
-    Estimate the compression ratio (n_compressed / n_obs).
+    Estimate the compression ratio of the model design.
+
+    Calculates the number of unique groups formed by the combination of 
+    regressors and fixed effects, divided by the total number of observations. 
+    This serves as a heuristic for degrees of freedom and data sparsity.
+
+    Parameters
+    ----------
+    x_cols : list of str
+        List of regressor column names.
+    fe_cols : list of str
+        List of fixed effect column names.
+    data : str or pl.LazyFrame, optional
+        The dataset to analyze. If a string is provided, it is treated as a 
+        table name within the DuckDB connection.
+    con : DuckDBPyConnection, optional
+        An active DuckDB connection. Required if `data` is a table name 
+        or if executing via SQL.
+
+    Returns
+    -------
+    float
+        The compression ratio (between 0 and 1). A value closer to 0 indicates 
+        significant grouping/redundancy.
+
+    Notes
+    -----
+    Inspired by the `dbreg` R package:
+    https://github.com/grantmcdermott/dbreg/blob/main/R/dbreg.R#L587-L654
+    """
     
-    Ported from dbreg: 
-    Calculates unique groups across (regressors + fixed effects) / total rows.
-    """
     key_cols = list(set(x_cols + fe_cols))
     if not key_cols:
         return 1.0
@@ -208,19 +234,27 @@ def estimate_compression_ratio(
         table_ref = f"read_parquet('{data}')" if isinstance(data, str) else "raw_data"
         
         # 1. Total rows
-        total_n = con.execute(f"SELECT COUNT(*)::BIGINT FROM {table_ref}").fetchone()[0]
+        res = con.execute(f"SELECT COUNT(*)::BIGINT FROM {table_ref}").fetchone()
+        if res is None:
+            raise RuntimeError("Query failed to return a count.")
+        total_n = int(res[0])
         
         # 2. Count distinct tuples (compressed size)
         cols_expr = ", ".join(key_cols)
         distinct_sql = f"SELECT COUNT(*)::BIGINT FROM (SELECT DISTINCT {cols_expr} FROM {table_ref}) t"
-        n_groups_total = con.execute(distinct_sql).fetchone()[0]
-        
+        distinct_res = con.execute(distinct_sql).fetchone()
+        if distinct_res is None:
+            raise RuntimeError("Query failed to return a distinct count.")
+        n_groups_total = int(distinct_res[0])
+                
     else:
-        # Polars Backend
-        df = data if isinstance(data, pl.DataFrame) else pl.read_parquet(data)
-        total_n = len(df)
-        # Unique combinations of all relevant columns
-        n_groups_total = df.select(key_cols).unique().height
+        if isinstance(data, str):
+            lf = pl.scan_parquet(data)
+        if isinstance(data, pl.LazyFrame):
+            lf = data
+            total_n = lf.select(pl.len()).collect().item() 
+            # Unique combinations of all relevant columns
+            n_groups_total = lf.select(key_cols).unique().select(pl.len()).collect().item()
 
     comp_rat = n_groups_total / max(total_n, 1)
     return comp_rat
@@ -265,9 +299,11 @@ def compress_duckdb(
         group_cols = group_cols + [cluster_col]
     
     group_cols_sql = ", ".join(group_cols)
-    
-    n_obs_original = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
-    
+    res = con.execute("SELECT COUNT(*) FROM data").fetchone()
+    if res is None:
+        raise RuntimeError("Query failed to return a count.")
+    n_obs_original = int(res[0])
+
     if weights is not None:
         query = f"""
         SELECT
@@ -299,14 +335,17 @@ def compress_duckdb(
     return compressed, n_obs_original
 
 
-def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: list[str], backend: str) -> tuple[
-    np.ndarray, 
-    np.ndarray, 
-    np.ndarray, 
-    Callable[[str | list[str]], np.ndarray]
-    ]:       # get_fe_values function:
+def _extract_numpy_arrays(
+    compressed_df: pl.DataFrame | DuckDBResult, 
+    x_cols: list[str], 
+) -> tuple[
+    np.ndarray,                       # X_reg
+    np.ndarray,                       # Y
+    np.ndarray,                       # wts
+    Callable[[str | list[str]], Any]  # get_fe_values
+]:
     """Extract numpy arrays from compressed dataframe without pandas dependency."""
-    if backend == "polars":
+    if isinstance(compressed_df, pl.DataFrame):
         # Use Polars native to_numpy() - no pandas needed
         X_reg = compressed_df.select(pl.ones(pl.len()), pl.col(x_cols)).to_numpy()
         Y = compressed_df.select(pl.col("_mean_y")).to_numpy().flatten()
@@ -330,9 +369,8 @@ def build_design_matrix(
     compressed_df: pl.DataFrame | DuckDBResult,
     x_cols: list[str],
     fe_cols: list[str],
-    backend: str = "polars",
     use_sparse: bool = True
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], int]:
+) -> tuple[ArrayLike, np.ndarray, np.ndarray,    list[str], int]:
     """
     Build design matrix from compressed data with FE dummies.
     
@@ -343,7 +381,7 @@ def build_design_matrix(
         all_col_names now includes '(Intercept)' as first element
     """
     # Extract numpy arrays without pandas dependency
-    X_reg, Y, wts, get_fe_values = _extract_numpy_arrays(compressed_df, x_cols, backend)
+    X_reg, Y, wts, get_fe_values = _extract_numpy_arrays(compressed_df, x_cols)
     n_rows = len(Y)
 
     # Create column names with intercept
@@ -433,7 +471,7 @@ def build_design_matrix(
 
 
 def solve_wls(
-    X,  # np.ndarray or sparse matrix
+    X: ArrayLike,
     Y: np.ndarray,
     wts: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -459,7 +497,7 @@ def solve_wls(
     if is_sparse:
         # Sparse weighted least squares
         # Weight the design matrix: diag(wts) @ X
-        Xw = X.multiply(wts[:, np.newaxis])
+        Xw = X * wts[:, np.newaxis]
         Yw = Y * wts
         
         # X'X is dense (p x p is typically small)
@@ -494,8 +532,8 @@ def solve_wls(
 
 
 def compute_rss_grouped(
-    compressed_df,
-    X,  # np.ndarray or sparse matrix
+    compressed_df: pl.DataFrame | DuckDBResult,
+    X: ArrayLike, 
     beta: np.ndarray,
     backend: str = "polars"
 ) -> tuple[float, np.ndarray]:
@@ -688,7 +726,7 @@ def compute_se_compress(
 
 
 def leanfe_compress_polars(
-    df: pl.DataFrame,
+    lf: pl.LazyFrame,
     y_col: str,
     x_cols: list[str],
     fe_cols: list[str],
@@ -696,20 +734,51 @@ def leanfe_compress_polars(
     vcov: str = "iid",
     cluster_col: str | None = None,
     ssc: bool = False
-) -> dict[str, dict[str, Any] | int | float | str | None]:
+) -> LeanFEResult:
     """
-    Run compressed regression using Polars backend.
+    Execute high-dimensional fixed effects regression via data compression.
+    Backend: Polars.
+
+    Compresses data into unique groups of (regressors + fixed effects) to solve 
+    WLS efficiently. Returns estimates.
+
+    Parameters
+    ----------
+    lf : pl.LazyFrame
+        Input dataset.
+    y_col : str
+        Dependent variable name.
+    x_cols : list[str]
+        Independent variable names.
+    fe_cols : list[str]
+        Fixed effect column names.
+    weights : str, optional
+        Weight column name.
+    vcov : {"iid", "cluster"}, default "iid"
+        Variance-covariance type.
+    cluster_col : str, optional
+        Column for clustered SEs; required if vcov="cluster".
+    ssc : bool, default False
+        Apply small-sample correction.
+
+    Returns
+    -------
+    dict
+        Results containing:
+        - coefficients, std_errors: Mappings for x_cols.
+        - n_obs, n_compressed, compression_ratio: Data scale metrics.
+        - df_resid, rss, n_clusters: Model fit statistics.
     """
     # Compress data
     compressed, n_obs = compress_polars(
-        df, y_col, x_cols, fe_cols, weights, 
+        lf, y_col, x_cols, fe_cols, weights, 
         cluster_col=cluster_col if vcov.lower() == "cluster" else None
     )
     n_compressed = len(compressed)
     
     # Build design matrix - all_cols now includes '(Intercept)'
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
-        compressed, x_cols, fe_cols, backend="polars"
+        compressed, x_cols, fe_cols
     )
     
     # Solve WLS
@@ -752,19 +821,16 @@ def leanfe_compress_polars(
     se_x = se[1:]  # Skip intercept
     
     
-    return {
-        "coefficients": dict(zip(x_cols, beta_x)),
-        "std_errors": dict(zip(x_cols, se_x)),
-        "n_obs": n_obs,
-        "n_compressed": n_compressed,
-        "compression_ratio": n_compressed / n_obs,
-        "vcov_type": vcov,
-        "strategy": "compress",
-        "df_resid": df_resid,
-        "rss": rss_total,
-        "n_clusters": n_clusters,
-    }
-
+    return LeanFEResult(
+        coefficients=dict(zip(x_cols, beta_x)),
+        std_errors=dict(zip(x_cols, se_x)),
+        n_compressed = n_compressed,
+        n_obs=n_obs,
+        vcov_type=vcov,
+        df_resid=df_resid,
+        rss=rss_total,
+        n_clusters=n_clusters
+    )
 
 def leanfe_compress_duckdb(
     con: DuckDBPyConnection,
@@ -775,9 +841,40 @@ def leanfe_compress_duckdb(
     vcov: str = "iid",
     cluster_col: str | None = None,
     ssc: bool = False
-) -> dict[str, dict[str, Any] | int | float | str | None]:
+) -> LeanFEResult:
     """
-    Run compressed regression using DuckDB backend.
+    Execute high-dimensional fixed effects regression via data compression.
+    Backend: DuckDB.
+
+    Compresses data into unique groups of (regressors + fixed effects) to solve 
+    WLS efficiently. Returns estimates.
+
+    Parameters
+    ----------
+    con : DuckDBPyConnection
+        Connection to a DuckDB (either persistent or in-memory).
+    y_col : str
+        Dependent variable name.
+    x_cols : list[str]
+        Independent variable names.
+    fe_cols : list[str]
+        Fixed effect column names.
+    weights : str, optional
+        Weight column name.
+    vcov : {"iid", "cluster"}, default "iid"
+        Variance-covariance type.
+    cluster_col : str, optional
+        Column for clustered SEs; required if vcov="cluster".
+    ssc : bool, default False
+        Apply small-sample correction.
+
+    Returns
+    -------
+    dict
+        Results containing:
+        - coefficients, std_errors: Mappings for x_cols.
+        - n_obs, n_compressed, compression_ratio: Data scale metrics.
+        - df_resid, rss, n_clusters: Model fit statistics.
     """
     # Compress data
     compressed, n_obs = compress_duckdb(
@@ -788,7 +885,7 @@ def leanfe_compress_duckdb(
     
     # Build design matrix - all_cols now includes '(Intercept)'
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
-        compressed, x_cols, fe_cols, backend="duckdb"
+        compressed, x_cols, fe_cols
     )
     
     # Solve WLS
@@ -830,15 +927,13 @@ def leanfe_compress_duckdb(
     beta_x = beta[1:k_x]  # Skip intercept
     se_x = se[1:]  # Skip intercept
     
-    return {
-        "coefficients": dict(zip(x_cols, beta_x)),
-        "std_errors": dict(zip(x_cols, se_x)),
-        "n_obs": n_obs,
-        "n_compressed": n_compressed,
-        "compression_ratio": n_compressed / n_obs,
-        "vcov_type": vcov,
-        "strategy": "compress",
-        "df_resid": df_resid,
-        "rss": rss_total,
-        "n_clusters": n_clusters,
-    }
+    return LeanFEResult(
+        coefficients=dict(zip(x_cols, beta_x)),
+        std_errors=dict(zip(x_cols, se_x)),
+        n_compressed = n_compressed,
+        n_obs=n_obs,
+        vcov_type=vcov,
+        df_resid=df_resid,
+        rss=rss_total,
+        n_clusters=n_clusters
+    )
