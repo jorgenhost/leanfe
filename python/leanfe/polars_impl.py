@@ -254,11 +254,11 @@ def leanfe_polars(
     # NOTE: A "hybrid" approach (demean high-card FEs, then YOCO on low-card) was tested
     # but is mathematically incorrect. After partial demeaning, Y still has non-zero means
     # within low-card FE groups, so adding dummies doesn't give the same result as full FWL.
-        
+    # Compute FE cardinality to decide strategy
+    fe_cardinality = {fe: lf.select(pl.col(fe).n_unique()).collect().item() for fe in fe_cols}
+
     if strategy == 'auto':
 
-        # Compute FE cardinality to decide strategy
-        fe_cardinality = {fe: lf.select(pl.col(fe).n_unique()).collect().item() for fe in fe_cols}
         n_obs_initial = lf.select(pl.len()).collect().item()
 
         est_comp_ratio = estimate_compression_ratio(
@@ -301,7 +301,7 @@ def leanfe_polars(
         return result
 
     if strategy == 'alt_proj':
-        print('Using FWL/alternating projections strategy..')
+        print('Using FWL/alternating projections strategy...')
         # Fall back to FWL demeaning for cluster SEs or IV
         # Extract weights if provided
         if weights is not None:
