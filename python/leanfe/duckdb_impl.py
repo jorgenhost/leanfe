@@ -100,117 +100,135 @@ def leanfe_duckdb(
     if weights is not None and weights not in needed_cols:
         needed_cols.append(weights)
     
-    # Setup DuckDB connection
-    con = duckdb.connect()
-    con.execute("SET memory_limit='4GB'")
-    con.execute("SET threads=4")
-    
-    try:
-        # Register data source
-        if isinstance(data, str):
-            col_list = ', '.join(needed_cols)
-            con.execute(f"CREATE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
-        else:
-            df = data.select(needed_cols)
-            con.register("raw_data", df.to_arrow())
-        
-        # Sample if requested
-        if sample_frac is not None:
-            con.execute(f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%")
-        else:
-            con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
-        
-        # Handle interactions
-        if interactions:
-            for var, factor, ref in interactions:
-                cats = [r[0] for r in con.execute(f"SELECT DISTINCT {factor} FROM data ORDER BY {factor}").fetchall()]
-                # Determine reference category
-                if ref is None:
-                    ref_cat = cats[0]  # Default: first category
-                else:
-                    # Try to match type
-                    ref_cat = ref
-                    if cats and not isinstance(cats[0], str):
-                        try:
-                            ref_cat = type(cats[0])(ref)
-                        except (ValueError, TypeError):
-                            pass
-                    if ref_cat not in cats:
-                        raise ValueError(f"Reference category '{ref}' not found in {factor}. Available: {cats}")
-                
-                for cat in cats:
-                    if cat == ref_cat:
-                        continue  # Skip reference category
-                    col_name = f"{var}_{cat}"
-                    con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                    con.execute(f"UPDATE data SET {col_name} = CASE WHEN {factor} = '{cat}' THEN {var} ELSE 0 END")
-                    x_cols.append(col_name)
-        
-        # Handle factor variables
-        if factor_vars:
-            for var, ref in factor_vars:
-                cats = [r[0] for r in con.execute(f"SELECT DISTINCT {var} FROM data ORDER BY {var}").fetchall()]
-                # Determine reference category
-                if ref is None:
-                    ref_cat = cats[0]  # Default: first category
-                else:
-                    # Try to match type
-                    ref_cat = ref
-                    if cats and not isinstance(cats[0], str):
-                        try:
-                            ref_cat = type(cats[0])(ref)
-                        except (ValueError, TypeError):
-                            pass
-                    if ref_cat not in cats:
-                        raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {cats}")
-                
-                for cat in cats:
-                    if cat == ref_cat:
-                        continue  # Skip reference category
-                    col_name = f"{var}_{cat}"
-                    con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                    con.execute(f"UPDATE data SET {col_name} = CASE WHEN {var} = '{cat}' THEN 1 ELSE 0 END")
-                    x_cols.append(col_name)
-        
-        # Check if we should use compression strategy (faster for IID/HC1 without IV)
-        # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
-        is_iv = len(instruments) > 0
-        
-        # Compute FE cardinality to decide strategy
-        fe_cardinality = {}
-        for fe in fe_cols:
-            card = con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0]
-            fe_cardinality[fe] = card
-        n_obs_initial = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
-        use_compress = should_use_compress(
-            vcov, is_iv, fe_cardinality,
-            max_fe_levels=10000,
-            n_obs=n_obs_initial,
-            n_x_cols=len(x_cols)
+    # Register data source
+    if isinstance(data, str) and isinstance(con, duckdb.DuckDBPyConnection):
+        col_list = ', '.join(needed_cols)
+        con.execute(f"CREATE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
+    elif isinstance(data, pl.DataFrame): 
+        df = data.select(needed_cols)
+        con.register("raw_data", df)
+    elif isinstance(data, pl.LazyFrame):
+        df = data.select(needed_cols).collect()
+        con.register('raw_data', df)
+    else:
+        raise ValueError(
+            'Please specify either data or con argument'
         )
-        
-        if use_compress:
-            # Use YOCO compression strategy - much faster and lower memory
-            # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
-            cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
-            result = leanfe_compress_duckdb(
-                con=con,
-                y_col=y_col,
-                x_cols=x_cols,
-                fe_cols=fe_cols,
-                weights=weights,
-                vcov=vcov,
-                cluster_col=cluster_col,
-                ssc=ssc
-            )
-            # Add missing fields for compatibility
-            result["iterations"] = 0
-            result["is_iv"] = False
-            result["n_instruments"] = None
-            result["formula"] = formula
-            result["fe_cols"] = fe_cols
-            return result
-        
+    # Sample if requested
+    if sample_frac is not None:
+        con.execute(f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%")
+    else:
+        con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
+    
+    # Handle interactions
+    if interactions:
+        for var, factor, ref in interactions:
+            cats = [r[0] for r in con.execute(f"SELECT DISTINCT {factor} FROM data ORDER BY {factor}").fetchall()]
+            # Determine reference category
+            if ref is None:
+                ref_cat = cats[0]  # Default: first category
+            else:
+                # Try to match type
+                ref_cat = ref
+                if cats and not isinstance(cats[0], str):
+                    try:
+                        ref_cat = type(cats[0])(ref)
+                    except (ValueError, TypeError):
+                        pass
+                if ref_cat not in cats:
+                    raise ValueError(f"Reference category '{ref}' not found in {factor}. Available: {cats}")
+            
+            for cat in cats:
+                if cat == ref_cat:
+                    continue  # Skip reference category
+                col_name = f"{var}_{cat}"
+                con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
+                con.execute(f"UPDATE data SET {col_name} = CASE WHEN {factor} = '{cat}' THEN {var} ELSE 0 END")
+                x_cols.append(col_name)
+    
+    # Handle factor variables
+    if factor_vars:
+        for var, ref in factor_vars:
+            cats = [r[0] for r in con.execute(f"SELECT DISTINCT {var} FROM data ORDER BY {var}").fetchall()]
+            # Determine reference category
+            if ref is None:
+                ref_cat = cats[0]  # Default: first category
+            else:
+                # Try to match type
+                ref_cat = ref
+                if cats and not isinstance(cats[0], str):
+                    try:
+                        ref_cat = type(cats[0])(ref)
+                    except (ValueError, TypeError):
+                        pass
+                if ref_cat not in cats:
+                    raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {cats}")
+            
+            for cat in cats:
+                if cat == ref_cat:
+                    continue  # Skip reference category
+                col_name = f"{var}_{cat}"
+                con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
+                con.execute(f"UPDATE data SET {col_name} = CASE WHEN {var} = '{cat}' THEN 1 ELSE 0 END")
+                x_cols.append(col_name)
+    
+    # Check if we should use compression strategy (faster for IID/HC1 without IV)
+    # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
+    is_iv = len(instruments) > 0
+    
+    # Compute FE cardinality to decide strategy
+    fe_cardinality = {}
+    for fe in fe_cols:
+        card = con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0]
+        fe_cardinality[fe] = card
+    
+    n_obs_initial = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+
+
+    if strategy == 'auto':
+        est_comp_ratio = estimate_compression_ratio(
+            con = con,
+            x_cols = x_cols,
+            fe_cols = fe_cols
+        )
+
+        inferred_strategy = determine_strategy(
+            vcov, is_iv, fe_cardinality,
+            max_fe_levels=MAX_FE_LEVELS,
+            n_obs=n_obs_initial,
+            n_x_cols=len(x_cols),
+            estimated_compression_ratio=est_comp_ratio
+        )
+
+        print(f'Auto strategy: Inferring {inferred_strategy} strategy')
+        strategy = inferred_strategy
+
+    
+    if strategy == 'compress':
+        print('Using compresssion strategy...')
+        # Use YOCO compression strategy - much faster and lower memory
+        # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
+        cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
+        result = leanfe_compress_duckdb(
+            con=con,
+            y_col=y_col,
+            x_cols=x_cols,
+            fe_cols=fe_cols,
+            weights=weights,
+            vcov=vcov,
+            cluster_col=cluster_col,
+            ssc=ssc
+        )
+        # Add missing fields for compatibility
+        result["iterations"] = 0
+        result["is_iv"] = False
+        result["n_instruments"] = None
+        result["formula"] = formula
+        result["fe_cols"] = fe_cols
+        return result
+
+    if strategy == 'alt_proj':
+        print('Using FWL/alternating projections strategy due to high FE dimensionality...')
         # Fall back to FWL demeaning for cluster SEs or IV
         # Drop singletons
         for fe in fe_cols:
