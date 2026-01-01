@@ -274,117 +274,118 @@ def leanfe_duckdb(
                         max_mean = max(max_mean, abs(result or 0))
                 if max_mean < demean_tol:
                     break
+    
+    k = len(x_cols)
+    is_iv = len(instruments) > 0
+    
+    if is_iv:
+        # Extract data for IV
+        select_cols = [f"{col}_dm" for col in [y_col] + x_cols + instruments]
+        if weights is not None:
+            select_cols.append(weights)
+        if cluster_cols is not None:
+            select_cols.extend(cluster_cols)
         
-        k = len(x_cols)
-        is_iv = len(instruments) > 0
+        result_df = con.execute(f"SELECT {', '.join(select_cols)} FROM data").pl()
+        Y = result_df[f"{y_col}_dm"].to_numpy()
+        X = result_df[[f"{col}_dm" for col in x_cols]].to_numpy()
+        Z = result_df[[f"{col}_dm" for col in instruments]].to_numpy()
+        w = result_df[weights].to_numpy() if weights is not None else None
         
-        if is_iv:
-            # Extract data for IV
-            select_cols = [f"{col}_dm" for col in [y_col] + x_cols + instruments]
+        beta, X_hat = iv_2sls(Y, X, Z, w)
+        resid = Y - X_hat @ beta
+    else:
+        # OLS via SQL aggregates
+        XtX = np.zeros((k, k))
+        Xty = np.zeros(k)
+        
+        for i, col_i in enumerate(x_cols):
+            col_i_dm = f"{col_i}_dm"
+            Xty[i] = con.execute(f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data").fetchone()[0]
+            for j in range(i, k):
+                col_j_dm = f"{x_cols[j]}_dm"
+                val = con.execute(f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data").fetchone()[0]
+                XtX[i, j] = val
+                XtX[j, i] = val
+        
+        beta = np.linalg.solve(XtX, Xty)
+        
+        resid_expr = f"{y_col}_dm - (" + " + ".join([f"{b} * {col}_dm" for b, col in zip(beta, x_cols)]) + ")"
+        con.execute("ALTER TABLE data ADD COLUMN _resid DOUBLE")
+        con.execute(f"UPDATE data SET _resid = {resid_expr}")
+    
+    # Degrees of freedom
+    n_fe_groups = sum(con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0] for fe in fe_cols)
+    absorbed_df = n_fe_groups - len(fe_cols)
+    df_resid = n_obs - k - absorbed_df
+    
+    # Compute XtX_inv
+    if is_iv:
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            X_hat_w = X_hat * sqrt_w[:, np.newaxis]
+            XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+        else:
+            XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+    else:
+        XtX_inv = np.linalg.inv(XtX)
+    
+    # Standard errors
+    if is_iv:
+        cluster_ids = None
+        if vcov == "cluster":
+            if cluster_cols is None:
+                raise ValueError("cluster_cols required for vcov='cluster'")
+            if len(cluster_cols) == 1:
+                cluster_ids = result_df[cluster_cols[0]].to_numpy()
+            else:
+                cluster_ids = result_df[cluster_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1).to_numpy()
+        
+        se, n_clusters = compute_standard_errors(
+            XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
+            vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
+        )
+    else:
+        n_clusters = None
+        if vcov == "iid":
             if weights is not None:
-                select_cols.append(weights)
-            if cluster_cols is not None:
-                select_cols.extend(cluster_cols)
-            
-            result_df = con.execute(f"SELECT {', '.join(select_cols)} FROM data").fetchdf()
-            Y = result_df[f"{y_col}_dm"].values
-            X = result_df[[f"{col}_dm" for col in x_cols]].values
-            Z = result_df[[f"{col}_dm" for col in instruments]].values
-            w = result_df[weights].values if weights is not None else None
-            
-            beta, X_hat = iv_2sls(Y, X, Z, w)
-            resid = Y - X_hat @ beta
-        else:
-            # OLS via SQL aggregates
-            XtX = np.zeros((k, k))
-            Xty = np.zeros(k)
-            
+                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()[0]
+            else:
+                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()[0]
+            se = np.sqrt(sigma2 * np.diag(XtX_inv))
+        elif vcov == "HC1":
+            meat = np.zeros((k, k))
             for i, col_i in enumerate(x_cols):
-                col_i_dm = f"{col_i}_dm"
-                Xty[i] = con.execute(f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data").fetchone()[0]
                 for j in range(i, k):
-                    col_j_dm = f"{x_cols[j]}_dm"
-                    val = con.execute(f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data").fetchone()[0]
-                    XtX[i, j] = val
-                    XtX[j, i] = val
-            
-            beta = np.linalg.solve(XtX, Xty)
-            
-            resid_expr = f"{y_col}_dm - (" + " + ".join([f"{b} * {col}_dm" for b, col in zip(beta, x_cols)]) + ")"
-            con.execute("ALTER TABLE data ADD COLUMN _resid DOUBLE")
-            con.execute(f"UPDATE data SET _resid = {resid_expr}")
-        
-        # Degrees of freedom
-        n_fe_groups = sum(con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0] for fe in fe_cols)
-        absorbed_df = n_fe_groups - len(fe_cols)
-        df_resid = n_obs - k - absorbed_df
-        
-        # Compute XtX_inv
-        if is_iv:
-            if w is not None:
-                sqrt_w = np.sqrt(w)
-                X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-                XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+                    col_j = x_cols[j]
+                    if weights is not None:
+                        val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
+                    else:
+                        val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
+                    meat[i, j] = val
+                    meat[j, i] = val
+            vcov_matrix = XtX_inv @ meat @ XtX_inv
+            se = np.sqrt((n_obs / df_resid) * np.diag(vcov_matrix))
+        elif vcov == "cluster":
+            if cluster_cols is None:
+                raise ValueError("cluster_cols required for vcov='cluster'")
+            cluster_expr = cluster_cols[0] if len(cluster_cols) == 1 else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
+            if weights is not None:
+                score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" for i, col in enumerate(x_cols)]
             else:
-                XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+                score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" for i, col in enumerate(x_cols)]
+            cluster_scores = con.execute(f"SELECT {cluster_expr} AS cluster_id, {', '.join(score_exprs)} FROM data GROUP BY {cluster_expr}").pl()
+            n_clusters = len(cluster_scores)
+            S = cluster_scores[[f"score_{i}" for i in range(k)]].to_numpy()
+            meat = S.T @ S
+            adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) if ssc else n_clusters / (n_clusters - 1)
+            vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
+            se = np.sqrt(np.diag(vcov_matrix))
         else:
-            XtX_inv = np.linalg.inv(XtX)
-        
-        # Standard errors
-        if is_iv:
-            cluster_ids = None
-            if vcov == "cluster":
-                if cluster_cols is None:
-                    raise ValueError("cluster_cols required for vcov='cluster'")
-                if len(cluster_cols) == 1:
-                    cluster_ids = result_df[cluster_cols[0]].values
-                else:
-                    cluster_ids = result_df[cluster_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1).values
-            
-            se, n_clusters = compute_standard_errors(
-                XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
-                vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
-            )
-        else:
-            n_clusters = None
-            if vcov == "iid":
-                if weights is not None:
-                    sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()[0]
-                else:
-                    sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()[0]
-                se = np.sqrt(sigma2 * np.diag(XtX_inv))
-            elif vcov == "HC1":
-                meat = np.zeros((k, k))
-                for i, col_i in enumerate(x_cols):
-                    for j in range(i, k):
-                        col_j = x_cols[j]
-                        if weights is not None:
-                            val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
-                        else:
-                            val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
-                        meat[i, j] = val
-                        meat[j, i] = val
-                vcov_matrix = XtX_inv @ meat @ XtX_inv
-                se = np.sqrt((n_obs / df_resid) * np.diag(vcov_matrix))
-            elif vcov == "cluster":
-                if cluster_cols is None:
-                    raise ValueError("cluster_cols required for vcov='cluster'")
-                cluster_expr = cluster_cols[0] if len(cluster_cols) == 1 else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
-                if weights is not None:
-                    score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" for i, col in enumerate(x_cols)]
-                else:
-                    score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" for i, col in enumerate(x_cols)]
-                cluster_scores = con.execute(f"SELECT {cluster_expr} AS cluster_id, {', '.join(score_exprs)} FROM data GROUP BY {cluster_expr}").fetchdf()
-                n_clusters = len(cluster_scores)
-                S = cluster_scores[[f"score_{i}" for i in range(k)]].values
-                meat = S.T @ S
-                adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) if ssc else n_clusters / (n_clusters - 1)
-                vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
-                se = np.sqrt(np.diag(vcov_matrix))
-            else:
-                raise ValueError(f"Unknown vcov: {vcov}")
-    finally:
-        con.close()
+            raise ValueError(f"Unknown vcov: {vcov}")
+
+    # Let's not kill the users connection, but only drop the view
+    con.execute("DROP VIEW IF EXISTS raw_data")
     
     return build_result(
         x_cols=x_cols,
