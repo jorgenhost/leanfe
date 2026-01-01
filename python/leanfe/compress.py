@@ -225,13 +225,13 @@ def estimate_compression_ratio(
     return comp_rat
 
 def compress_duckdb(
-    con,
+    con: DuckDBPyConnection,
     y_col: str,
-    x_cols: List[str],
-    fe_cols: List[str],
-    weights: Optional[str] = None,
-    cluster_col: Optional[str] = None
-) -> Tuple[DuckDBResult, int]:
+    x_cols: list[str],
+    fe_cols: list[str],
+    weights: str | None = None,
+    cluster_col: str | None = None
+) -> tuple[DuckDBResult, int]:
     """
     Compress data using SQL GROUP BY.
     
