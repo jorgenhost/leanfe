@@ -4,6 +4,7 @@ DuckDB-based fixed effects regression implementation.
 Optimized for memory efficiency using in-database operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
+from numba import none
 
 import duckdb
 import numpy as np
@@ -13,7 +14,6 @@ from leanfe.common import (
     parse_formula,
     iv_2sls,
     compute_standard_errors,
-    build_result,
     LeanFEResult
 )
 from leanfe.compress import determine_strategy, leanfe_compress_duckdb, estimate_compression_ratio
@@ -71,6 +71,9 @@ def leanfe_duckdb(
         coefficients, std_errors, n_obs, iterations, vcov_type, 
         is_iv, n_instruments, n_clusters
     """
+
+    assert con is not None, "User must provide a duckdb.connect() object."
+
     # Parse formula if provided
     if formula is not None:
         y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
@@ -103,7 +106,7 @@ def leanfe_duckdb(
         needed_cols.append(weights)
     
     # Register data source
-    if isinstance(data, str) and isinstance(con, duckdb.DuckDBPyConnection):
+    if isinstance(data, str):
         col_list = ', '.join(needed_cols)
         con.execute(f"CREATE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
     elif isinstance(data, pl.DataFrame): 
@@ -118,7 +121,9 @@ def leanfe_duckdb(
         )
     # Sample if requested
     if sample_frac is not None:
-        con.execute(f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%")
+        frac_sql =  f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%"
+        con.execute(frac_sql)
+
     else:
         con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
     
@@ -181,11 +186,20 @@ def leanfe_duckdb(
     # Compute FE cardinality to decide strategy
     fe_cardinality = {}
     for fe in fe_cols:
-        card = con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0]
+        card_query = f"SELECT COUNT(DISTINCT {fe}) FROM data"
+
+        card = con.execute(card_query).fetchone()
+        if card is None:
+            raise ValueError(f'Error in computing FE ({fe}) cardinality, check dtype of {fe} or try different backend')
+        card = int(card[0])
         fe_cardinality[fe] = card
     
-    n_obs_initial = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+    n_obs_initial_query = "SELECT COUNT(*) FROM data"
+    n_obs_initial = con.execute(n_obs_initial_query).fetchone()
 
+    if n_obs_initial is None:
+        raise ValueError('Could not fetch number of obs/rows. Check for corrupted data')
+    n_obs_initial = int(n_obs_initial[0])
 
     if strategy == 'auto':
         est_comp_ratio = estimate_compression_ratio(
@@ -221,12 +235,10 @@ def leanfe_duckdb(
             cluster_col=cluster_col,
             ssc=ssc
         )
-        # Add missing fields for compatibility
-        result["iterations"] = 0
-        result["is_iv"] = False
-        result["n_instruments"] = None
-        result["formula"] = formula
-        result["fe_cols"] = fe_cols
+        # Update attributes directly
+        result.formula = formula
+        result.fe_cols = fe_cols
+        
         return result
 
     if strategy == 'alt_proj':
@@ -236,7 +248,11 @@ def leanfe_duckdb(
         for fe in fe_cols:
             con.execute(f"DELETE FROM data WHERE {fe} IN (SELECT {fe} FROM data GROUP BY {fe} HAVING COUNT(*) = 1)")
         
-        n_obs = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+        n_obs_query = "SELECT COUNT(*) FROM data"
+        n_obs_res = con.execute(n_obs_query).fetchone()
+        if n_obs_res is None:
+            raise ValueError('Error in fetching no of obs/rows')
+        n_obs = int(n_obs_res[0])
         cols_to_demean = [y_col] + x_cols + instruments
         
         # Order FEs by cardinality (low-card first) for faster convergence
@@ -272,7 +288,10 @@ def leanfe_duckdb(
                 max_mean = 0
                 for fe in fe_cols:
                     for col in dm_cols:
-                        result = con.execute(f"SELECT MAX(ABS(avg_val)) FROM (SELECT AVG({col}) as avg_val FROM data GROUP BY {fe})").fetchone()[0]
+                        result = con.execute(f"SELECT MAX(ABS(avg_val)) FROM (SELECT AVG({col}) as avg_val FROM data GROUP BY {fe})").fetchone()
+                        if result is None:
+                            raise ValueError(f'Could not demean {col}')
+                        result = result[0]
                         max_mean = max(max_mean, abs(result or 0))
                 if max_mean < demean_tol:
                     break
@@ -303,12 +322,18 @@ def leanfe_duckdb(
         
         for i, col_i in enumerate(x_cols):
             col_i_dm = f"{col_i}_dm"
-            Xty[i] = con.execute(f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data").fetchone()[0]
+            query_t_y = f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data"
+            Xty[i] = con.execute(query_t_y).fetchone()
+            if Xty[i]:
+                raise ValueError(f'Could not compute SUM({col_i_dm} * {y_col}_dm)')
             for j in range(i, k):
                 col_j_dm = f"{x_cols[j]}_dm"
-                val = con.execute(f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data").fetchone()[0]
-                XtX[i, j] = val
-                XtX[j, i] = val
+                col_j_dm_query = f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data"
+                val_j_dm = con.execute(col_j_dm_query).fetchone()
+                if val_j_dm is None:
+                    raise ValueError(f'Could not compute {col_j_dm_query}')
+                XtX[i, j] = val_j_dm
+                XtX[j, i] = val_j_dm
         
         beta = np.linalg.solve(XtX, Xty)
         
@@ -317,7 +342,12 @@ def leanfe_duckdb(
         con.execute(f"UPDATE data SET _resid = {resid_expr}")
     
     # Degrees of freedom
-    n_fe_groups = sum(con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0] for fe in fe_cols)
+    distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
+    distinct_fes = con.execute(f"SELECT {distinct_fes_query} FROM data").fetchone()
+    if distinct_fes is not None:
+        n_fe_groups = sum(distinct_fes)
+    else:   
+        n_fe_groups = 0
     absorbed_df = n_fe_groups - len(fe_cols)
     df_resid = n_obs - k - absorbed_df
     
@@ -339,10 +369,14 @@ def leanfe_duckdb(
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
             if len(cluster_cols) == 1:
-                cluster_ids = result_df[cluster_cols[0]].to_numpy()
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy()
             else:
-                cluster_ids = result_df[cluster_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1).to_numpy()
-        
+                cluster_ids = (
+                    result_df.select(
+                        pl.concat_str([pl.col(c).cast(pl.String) for c in cluster_cols], separator="_").cast(pl.Categorical).to_physical()
+                    )
+                    .to_numpy()
+                )        
         se, n_clusters = compute_standard_errors(
             XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
             vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
@@ -351,9 +385,15 @@ def leanfe_duckdb(
         n_clusters = None
         if vcov == "iid":
             if weights is not None:
-                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()[0]
+                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()
+                if sigma2 is None:
+                    raise ValueError('Could not compute sigma²')
+                sigma2 = sigma2[0]
             else:
-                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()[0]
+                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()
+                if sigma2 is None:
+                    raise ValueError('Could not compute sigma²')
+                sigma2 = sigma2[0]
             se = np.sqrt(sigma2 * np.diag(XtX_inv))
         elif vcov == "HC1":
             meat = np.zeros((k, k))
@@ -361,9 +401,15 @@ def leanfe_duckdb(
                 for j in range(i, k):
                     col_j = x_cols[j]
                     if weights is not None:
-                        val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
+                        val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()
+                        if val is None:
+                            raise ValueError(f'Could not compute (weighted) meat matrix, vcov = {vcov}')
+                        val = val[0]
                     else:
-                        val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
+                        val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()
+                        if val is None:
+                            raise ValueError(f'Could not compute meat matrix, vcov = {vcov}')
+                        val = val[0]
                     meat[i, j] = val
                     meat[j, i] = val
             vcov_matrix = XtX_inv @ meat @ XtX_inv
@@ -389,13 +435,12 @@ def leanfe_duckdb(
     # Let's not kill the users connection, but only drop the view
     con.execute("DROP VIEW IF EXISTS raw_data")
     
-    return build_result(
-        x_cols=x_cols,
-        beta=beta,
-        se=se,
+    return LeanFEResult(
+        coefficients=dict(zip(x_cols, beta)), 
+        std_errors=dict(zip(x_cols, se)),     
         n_obs=n_obs,
         iterations=it,
-        vcov=vcov,
+        vcov_type=vcov,                       
         is_iv=is_iv,
         n_instruments=len(instruments) if is_iv else None,
         n_clusters=n_clusters,
