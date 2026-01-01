@@ -18,7 +18,7 @@ from .common import (
 from .compress import should_use_compress, leanfe_compress_polars
 
 
-def _expand_factors(df: pl.DataFrame, factor_vars: List[tuple]) -> tuple:
+def _expand_factors(df: pl.DataFrame, factor_vars: list[tuple]) -> tuple:
     """
     Expand factor variables into dummy variables, dropping reference category.
     
@@ -36,6 +36,7 @@ def _expand_factors(df: pl.DataFrame, factor_vars: List[tuple]) -> tuple:
         (df, dummy_cols) - DataFrame with dummies added and list of dummy column names
     """
     dummy_cols = []
+    expr_list = []
     for var, ref in factor_vars:
         categories = df.select(pl.col(var).unique().sort()).to_series().to_list()
         if ref is None:
@@ -57,14 +58,17 @@ def _expand_factors(df: pl.DataFrame, factor_vars: List[tuple]) -> tuple:
             if cat == ref_cat:
                 continue  # Skip reference category
             dummy_name = f"{var}_{cat}"
-            df = df.with_columns(
-                (pl.col(var) == cat).cast(pl.Int8).alias(dummy_name)
-            )
+            expr = (pl.col(var) == cat).cast(pl.UInt8).alias(dummy_name)
+            expr_list.append(expr)
             dummy_cols.append(dummy_name)
+    if expr_list:
+        df = df.with_columns(
+            expr_list
+        )
     return df, dummy_cols
 
 
-def _expand_interactions(df: pl.DataFrame, interactions: List[tuple]) -> tuple:
+def _expand_interactions(df: pl.DataFrame, interactions: list[tuple]) -> tuple:
     """
     Expand interaction terms: var:i(factor) -> var_cat1, var_cat2, ...
     
@@ -82,6 +86,7 @@ def _expand_interactions(df: pl.DataFrame, interactions: List[tuple]) -> tuple:
         (df, interaction_cols) - DataFrame with interactions added and list of column names
     """
     interaction_cols = []
+    expr_list = []
     for var, factor, ref in interactions:
         categories = df.select(pl.col(factor).unique().sort()).to_series().to_list()
         if ref is None:
@@ -102,14 +107,17 @@ def _expand_interactions(df: pl.DataFrame, interactions: List[tuple]) -> tuple:
             if cat == ref_cat:
                 continue  # Skip reference category
             col_name = f"{var}_{cat}"
-            df = df.with_columns(
-                (pl.col(var) * (pl.col(factor) == cat)).cast(pl.Float64).alias(col_name)
-            )
+            expr = (pl.col(var) * (pl.col(factor) == cat)).cast(pl.Float64).alias(col_name)
+            expr_list.append(expr)
             interaction_cols.append(col_name)
+    if expr_list:
+        df = df.with_columns(
+            expr_list
+        )
     return df, interaction_cols
 
 
-def _optimize_dtypes(df: pl.DataFrame, fe_cols: List[str]) -> pl.DataFrame:
+def _optimize_dtypes(df: pl.DataFrame, fe_cols: list[str]) -> pl.DataFrame:
     """Optimize column types: downcast integers, categorize fixed effects."""
     
     lf = df.lazy()
