@@ -221,6 +221,8 @@ def leanfe_polars(
     # Load data
     if isinstance(data, str):
         df = pl.scan_parquet(data).select(needed_cols).collect()
+    elif isinstance(data, pl.LazyFrame):
+        df = data.select(needed_cols).collect()
     else:
         df = data.select(needed_cols)
     
