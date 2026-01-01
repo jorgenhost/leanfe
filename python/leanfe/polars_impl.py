@@ -111,19 +111,25 @@ def _expand_interactions(df: pl.DataFrame, interactions: List[tuple]) -> tuple:
 
 def _optimize_dtypes(df: pl.DataFrame, fe_cols: List[str]) -> pl.DataFrame:
     """Optimize column types: downcast integers, categorize fixed effects."""
-    for col in df.columns:
-        dtype = df[col].dtype
-        if dtype in (pl.Int64, pl.Int32, pl.Int16, pl.Int8):
-            col_min = df[col].min()
-            col_max = df[col].max()
-            if col_min >= -128 and col_max <= 127:
-                df = df.with_columns(pl.col(col).cast(pl.Int8))
-            elif col_min >= -32768 and col_max <= 32767:
-                df = df.with_columns(pl.col(col).cast(pl.Int16))
-            elif col_min >= -2147483648 and col_max <= 2147483647:
-                df = df.with_columns(pl.col(col).cast(pl.Int32))
-        elif col in fe_cols and dtype == pl.Utf8:
-            df = df.with_columns(pl.col(col).cast(pl.Categorical))
+    
+    lf = df.lazy()
+    
+    int_cols = lf.select(cs.integer()).collect_schema().names()
+    fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String)).collect_schema().names()
+    EXPR = [
+        pl.col(col).alias(col).cast(pl.Categorical)
+        for col in fe_cols_cast
+    ]
+
+    df = df.with_columns(
+        EXPR
+    )
+
+    for col in int_cols:
+        s = df.select(pl.col(col)).to_series().shrink_dtype()
+        df = df.with_columns(
+            s.alias(col)
+        )
     return df
 
 
