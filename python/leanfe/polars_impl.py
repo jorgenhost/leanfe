@@ -330,21 +330,23 @@ def leanfe_polars(
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
                 if weights is not None:
-                    means = df.group_by(fe).agg([
-                        (pl.col(c) * pl.col(weights)).sum().truediv(pl.col(weights).sum()).alias(f"{c}_mean") 
+                    demean_exprs = [
+                        (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) / 
+                        pl.col(weights).sum().over(fe)).alias(c)
                         for c in cols_to_demean
-                    ])
+                    ]
                 else:
-                    means = df.group_by(fe).agg([pl.col(c).mean().alias(f"{c}_mean") for c in cols_to_demean])
-                
-                df = df.join(means, on=fe, how="left")
-                for c in cols_to_demean:
-                    df = df.with_columns((pl.col(c) - pl.col(f"{c}_mean")).alias(c)).drop(f"{c}_mean")
-            
+                    demean_exprs = [
+                        (pl.col(c)-pl.col(c).mean().over(fe)).alias(c)
+                        for c in cols_to_demean
+                ]
+
+                df = df.with_columns(
+                    demean_exprs
+                )            
             if it >= 3:
                 max_mean = max(
-                    df.group_by(fe).agg(pl.col(y_col).mean().alias("m"))
-                    .select(pl.col("m").abs().max()).item()
+                    df.select(pl.col(y_col).mean().over(fe).abs().max()).item()
                     for fe in fe_cols
                 )
                 if max_mean < demean_tol:
