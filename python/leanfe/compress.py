@@ -308,17 +308,16 @@ def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: li
     """Extract numpy arrays from compressed dataframe without pandas dependency."""
     if backend == "polars":
         # Use Polars native to_numpy() - no pandas needed
-        X_reg = compressed_df.select(pl.col(x_cols)).to_numpy()
+        X_reg = compressed_df.select(pl.ones(pl.len()), pl.col(x_cols)).to_numpy()
         Y = compressed_df.select(pl.col("_mean_y")).to_numpy().flatten()
         wts = compressed_df.select(pl.col("_wts")).to_numpy().flatten()
         
         def get_fe_values(fe: str | list[str]):
-            if isinstance(fe, str):
-                return compressed_df.select(fe).to_numpy().flatten()
             return compressed_df.select(fe).to_numpy()
     else:
         # DuckDB returns DuckDBResult (dict-like with numpy arrays)
         X_reg = np.column_stack([compressed_df[col] for col in x_cols])
+        X_reg = np.column_stack((np.ones(shape=(X_reg.shape[0], 1)), X_reg))
         Y = compressed_df["_mean_y"]
         wts = compressed_df["_wts"]
         
@@ -326,7 +325,6 @@ def _extract_numpy_arrays(compressed_df: pl.DataFrame | DuckDBResult, x_cols: li
             return compressed_df[fe]
     
     return X_reg, Y, wts, get_fe_values  
-
 
 def build_design_matrix(
     compressed_df: pl.DataFrame,
@@ -360,6 +358,8 @@ def build_design_matrix(
     # Extract numpy arrays without pandas dependency
     X_reg, Y, wts, get_fe_values = _extract_numpy_arrays(compressed_df, x_cols, backend)
     n_rows = len(Y)
+
+    x_cols = ['(Intercept)'] + list(x_cols)
     
     if not fe_cols:
         return X_reg, Y, wts, list(x_cols), 0
@@ -376,7 +376,7 @@ def build_design_matrix(
         data_list = []
         
         for fe in fe_cols:
-            fe_values = get_fe_values(fe)
+            fe_values = get_fe_values(fe).flatten()
             categories = np.unique(fe_values)
             n_cats = len(categories)
             n_fe_levels += n_cats
@@ -880,7 +880,17 @@ def leanfe_compress_duckdb(
     )
     
     # Extract coefficients for x_cols only
-    beta_x = beta[:len(x_cols)]
+    k_x = len(x_cols) + 1  # Original count + 1 for Intercept
+    names_x = all_cols[:k_x]
+    
+    # 2. Pass the updated names to compute_se_compress so SEs align
+    se, n_clusters = compute_se_compress(
+        XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, names_x, # Use names_x
+        cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
+    )
+    
+    # 3. Slice the first k_x coefficients
+    beta_x = beta[:k_x]
     
     return {
         "coefficients": dict(zip(x_cols, beta_x)),
