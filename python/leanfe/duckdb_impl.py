@@ -7,6 +7,7 @@ Uses YOCO compression automatically for IID/HC1 standard errors.
 import duckdb
 import numpy as np
 import polars as pl
+import uuid
 
 from leanfe.result import LeanFEResult
 from leanfe.common import (
@@ -159,6 +160,15 @@ def leanfe_duckdb(
 
     assert con is not None, "User must provide a duckdb.connect() object."
 
+    # create unique prefix for all temp objects for this call
+    uid = uuid.uuid4().hex[:8]
+    def mk_tmp(name: str) -> str:
+        # safe SQL identifier (no hyphens). We'll quote when used.
+        return f"leanfe_{name}_{uid}"
+
+    tmp_table = mk_tmp("data")  # will become the working table name for this call
+    created_tmp_tables = [tmp_table]  # track for cleanup
+
     # Parse formula if provided
     if formula is not None:
         y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
@@ -190,31 +200,42 @@ def leanfe_duckdb(
     if weights is not None and weights not in needed_cols:
         needed_cols.append(weights)
     
-    # Register data source
+    col_list = ', '.join(needed_cols)
+
     if isinstance(data, str):
-        col_list = ', '.join(needed_cols)
-        con.execute(f"CREATE OR REPLACE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
-    elif isinstance(data, pl.DataFrame): 
-        df = data.select(needed_cols)
-        con.register("data", df)
+        # If sampling requested, do it in the same CREATE to avoid extra copies
+        if sample_frac is not None:
+            pct = sample_frac * 100
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') USING SAMPLE {pct}%"
+            )
+        else:
+            sql = f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS SELECT {col_list} FROM read_parquet('{data}')"
+        con.execute(sql)
+
+    elif isinstance(data, pl.DataFrame):
+        # Register the polars DF under a short ephemeral name, then materialize it
+        src_name = mk_tmp("src")
+        # register the DataFrame as a relation name and then create a TEMP TABLE from it
+        con.register(src_name, data.select(needed_cols))
+        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
+        created_tmp_tables.append(src_name)  # we may try to drop this registered name later (best-effort)
+
     elif isinstance(data, pl.LazyFrame):
         df = data.select(needed_cols).collect()
-        con.register('data', df)
+        src_name = mk_tmp("src")
+        con.register(src_name, df)
+        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
+        created_tmp_tables.append(src_name)
     else:
-        raise ValueError(
-            'Please specify either data or con argument'
-        )
-    # Sample if requested
-    if sample_frac is not None:
-        frac_sql =  f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%"        
-        con.execute(frac_sql)
-    else:
-        con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
+        raise ValueError('Please specify either data or con argument')
+
     # Handle interactions
     if interactions:
         new_cols = _expand_interactions_duckdb(
             con = con,
-            table_name = 'data',
+            table_name = 'tmp_table',
             interactions = interactions
         )
         x_cols = x_cols + new_cols
@@ -223,7 +244,7 @@ def leanfe_duckdb(
     if factor_vars:
         new_cols = _expand_factors_duckdb(
             con = con,
-            table_name = 'data',
+            table_name = 'tmp_table',
             factor_vars = factor_vars
         )
         x_cols = x_cols + new_cols
@@ -249,12 +270,14 @@ def leanfe_duckdb(
         raise ValueError('Could not fetch number of obs/rows. Check for corrupted data')
     n_obs_initial = int(n_obs_initial[0])
 
-    if strategy == 'auto':
-        est_comp_ratio = estimate_compression_ratio(
+    est_comp_ratio = estimate_compression_ratio(
             con = con,
             x_cols = x_cols,
             fe_cols = fe_cols
-        )
+    )
+
+    if strategy == 'auto':
+
 
         inferred_strategy = determine_strategy(
             vcov, is_iv, fe_cardinality,
@@ -273,6 +296,7 @@ def leanfe_duckdb(
         # Use YOCO compression strategy - much faster and lower memory
         # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
         cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
+
         result = leanfe_compress_duckdb(
             con=con,
             y_col=y_col,
@@ -283,10 +307,11 @@ def leanfe_duckdb(
             cluster_col=cluster_col,
             ssc=ssc
         )
+        
         # Update attributes directly
         result.formula = formula
         result.fe_cols = fe_cols
-        
+
         return result
 
     if strategy == 'alt_proj':
@@ -376,26 +401,36 @@ def leanfe_duckdb(
         beta, X_hat = iv_2sls(Y, X, Z, w)
         resid = Y - X_hat @ beta
     else:
-        # OLS via SQL aggregates
-        XtX = np.zeros((k, k))
-        Xty = np.zeros(k)
-        
-        for i, col_i in enumerate(x_cols):
-            col_i_dm = f"{col_i}_dm"
-            query_t_y = f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data"
-            res_t_y = con.execute(query_t_y).fetchone()
-            if res_t_y is None:
-                raise ValueError(f'Could not compute SUM({col_i_dm} * {y_col}_dm)')
-            Xty[i] = res_t_y[0]
+        # build expressions
+        agg_exprs = []
+        # X'y
+        for i, col in enumerate(x_cols):
+            agg_exprs.append(f"SUM({col}_dm * {y_col}_dm) AS xty_{i}")
+        # XtX upper triangle
+        for i, ci in enumerate(x_cols):
             for j in range(i, k):
-                col_j_dm = f"{x_cols[j]}_dm"
-                col_j_dm_query = f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data"
-                val_j_dm = con.execute(col_j_dm_query).fetchone()
-                if val_j_dm is None:
-                    raise ValueError(f'Could not compute {col_j_dm_query}')
-                XtX[i, j] = val_j_dm[0]
-                XtX[j, i] = val_j_dm[0]
-        
+                cj = x_cols[j]
+                agg_exprs.append(f"SUM({ci}_dm * {cj}_dm) AS xtx_{i}_{j}")
+
+        sql = f"SELECT {', '.join(agg_exprs)} FROM data"
+        row = con.execute(sql).fetchone()
+        if row is None:
+            raise ValueError("Failed to compute XtX/X'y in a single query")
+        vals = list(row)  # tuple -> list
+
+        # Unpack
+        idx = 0
+        Xty = np.zeros(k)
+        for i in range(k):
+            Xty[i] = vals[idx]
+            idx += 1
+
+        XtX = np.zeros((k, k))
+        for i in range(k):
+            for j in range(i, k):
+                XtX[i, j] = XtX[j, i] = vals[idx]
+                idx += 1
+
         beta = np.linalg.solve(XtX, Xty)
         
         resid_expr = f"{y_col}_dm - (" + " + ".join([f"{b} * {col}_dm" for b, col in zip(beta, x_cols)]) + ")"
@@ -457,35 +492,52 @@ def leanfe_duckdb(
                 sigma2 = sigma2[0]
             se = np.sqrt(sigma2 * np.diag(XtX_inv))
         elif vcov == "HC1":
-            meat = np.zeros((k, k))
-            for i, col_i in enumerate(x_cols):
+            k = len(x_cols)
+            meat_elements = []
+            for i in range(k):
                 for j in range(i, k):
-                    col_j = x_cols[j]
+                    # Calculate the sum of squares/products weighted by squared residuals
+                    col_i, col_j = x_cols[i], x_cols[j]
+                    expr = f"SUM({col_i}_dm * {col_j}_dm * _resid * _resid)"
                     if weights is not None:
-                        val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()
-                        if val is None:
-                            raise ValueError(f'Could not compute (weighted) meat matrix, vcov = {vcov}')
-                        val = val[0]
-                    else:
-                        val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()
-                        if val is None:
-                            raise ValueError(f'Could not compute meat matrix, vcov = {vcov}')
-                        val = val[0]
-                    meat[i, j] = val
-                    meat[j, i] = val
+                        expr = f"SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid)"
+                    meat_elements.append(f"{expr} AS m_{i}_{j}")
+            meat_row = con.execute(f"SELECT {', '.join(meat_elements)} FROM data").fetchone()
+            if meat_row is None:
+                raise ValueError('Could not compute meat row')
+            vals = list(meat_row)
+            meat = np.zeros((k, k))
+            idx = 0
+            for i in range(k):
+                for j in range(i, k):
+                    val = float(vals[idx] or 0.0)
+                    meat[i, j] = meat[j, i] = val
+                    idx += 1
             vcov_matrix = XtX_inv @ meat @ XtX_inv
             se = np.sqrt((n_obs / df_resid) * np.diag(vcov_matrix))
         elif vcov == "cluster":
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
-            cluster_expr = cluster_cols[0] if len(cluster_cols) == 1 else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
+            # 1. Handle multi-way clustering by creating a unique ID
+            cluster_id_sql = (
+                cluster_cols[0] if len(cluster_cols) == 1 
+                else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
+            )            
             if weights is not None:
                 score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" for i, col in enumerate(x_cols)]
             else:
                 score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" for i, col in enumerate(x_cols)]
-            cluster_scores = con.execute(f"SELECT {cluster_expr} AS cluster_id, {', '.join(score_exprs)} FROM data GROUP BY {cluster_expr}").pl()
-            n_clusters = len(cluster_scores)
-            S = cluster_scores[[f"score_{i}" for i in range(k)]].to_numpy()
+            
+            cluster_query = f"""
+                    SELECT {cluster_id_sql} AS cluster_id, {', '.join(score_exprs)} 
+                    FROM data 
+                    GROUP BY 1
+                """
+            score_df = con.execute(cluster_query).pl()
+            n_clusters = len(score_df)
+            S = score_df.select(pl.col([
+                f"score_{i}" for i in range(k)
+            ])).to_numpy()
             meat = S.T @ S
             adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) if ssc else n_clusters / (n_clusters - 1)
             vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
