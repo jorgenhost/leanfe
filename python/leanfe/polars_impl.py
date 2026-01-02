@@ -413,8 +413,6 @@ def leanfe_polars(
     fe_counts = {fe: df.group_by(fe).agg(pl.len()).height for fe in fe_cols}
     absorbed_df = sum(fe_counts.values()) - len(fe_cols)
     df_resid = n_obs - len(x_cols) - absorbed_df
-    
-    # Build cluster IDs if needed
     cluster_ids = None
     if vcov == "cluster":
         if cluster_cols is None:
@@ -422,10 +420,10 @@ def leanfe_polars(
         if len(cluster_cols) == 1:
             cluster_ids = df.select(cluster_cols[0]).to_numpy().flatten()
         else:
-            cluster_ids = df.select(
-                pl.concat_str([pl.col(c).cast(pl.String) for c in cluster_cols], separator="_")
-            ).to_numpy().flatten()
-    
+            # Multi-way clustering: pass as 2D array
+            cluster_ids = df.select(cluster_cols).to_numpy()
+
+    # Then call the new compute_multiway_standard_errors function    
     # Compute standard errors
     se, n_clusters = compute_standard_errors(
         XtX_inv=XtX_inv,

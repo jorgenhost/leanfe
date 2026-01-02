@@ -8,7 +8,8 @@ import re
 import numpy as np
 from typing import NamedTuple
 from leanfe.result import LeanFEResult
-
+from itertools import combinations
+from scipy import sparse
 
 class FormulaComponents(NamedTuple):
     y_col: str
@@ -18,6 +19,86 @@ class FormulaComponents(NamedTuple):
     interactions: list[tuple[str, str, str | None]]
     instruments: list[str]
 
+def _oneway_cluster_vcov(
+    XtX_inv: np.ndarray,
+    resid: np.ndarray,
+    X: np.ndarray,
+    weights: np.ndarray | None,
+    cluster_ids: np.ndarray,
+    n_obs: int,
+    df_resid: int,
+    ssc: bool
+) -> np.ndarray:
+    """Compute one-way clustered variance-covariance matrix."""
+    
+    unique_clusters, cluster_map = np.unique(cluster_ids, return_inverse=True)
+    n_clusters = len(unique_clusters)
+    
+    # Build sparse cluster indicator matrix
+    W_C = sparse.csr_matrix(
+        (np.ones(n_obs), (np.arange(n_obs), cluster_map)),
+        shape=(n_obs, n_clusters)
+    )
+    
+    # Compute scores
+    if weights is not None:
+        X_resid = X * (resid * weights)[:, np.newaxis]
+    else:
+        X_resid = X * resid[:, np.newaxis]
+    
+    scores = W_C.T @ X_resid
+    meat = scores.T @ scores
+    
+    # Adjustment
+    if ssc:
+        adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
+    else:
+        adjustment = n_clusters / (n_clusters - 1)
+    
+    return XtX_inv @ meat @ XtX_inv * adjustment
+
+def _multiway_cluster_vcov(
+    XtX_inv: np.ndarray,
+    resid: np.ndarray,
+    X: np.ndarray,
+    weights: np.ndarray | None,
+    cluster_ids: np.ndarray,
+    n_obs: int,
+    df_resid: int,
+    ssc: bool
+) -> np.ndarray:
+    """
+    Compute multi-way clustered variance-covariance matrix.
+    Uses Cameron-Gelbach-Miller (2011) approach.
+    """
+    
+    n_ways = cluster_ids.shape[1]
+    vcov_matrix = np.zeros_like(XtX_inv)
+    
+    # Sum over all non-empty subsets with alternating signs
+    for k in range(1, n_ways + 1):
+        sign = (-1) ** (k - 1)
+        
+        # Iterate over all k-way combinations
+        for idx_combo in combinations(range(n_ways), k):
+            # Create intersection cluster ID
+            if k == 1:
+                intersect_ids = cluster_ids[:, idx_combo[0]]
+            else:
+                # Concatenate cluster IDs for intersection
+                intersect_ids = np.array([
+                    '_'.join(str(cluster_ids[i, j]) for j in idx_combo)
+                    for i in range(n_obs)
+                ])
+            
+            # Compute variance for this clustering dimension
+            vcov_k = _oneway_cluster_vcov(
+                XtX_inv, resid, X, weights, intersect_ids, n_obs, df_resid, ssc
+            )
+            
+            vcov_matrix += sign * vcov_k
+    
+    return vcov_matrix
 
 def _parse_i_term(term: str) -> tuple[str, str | None]:
     """
@@ -187,31 +268,9 @@ def compute_standard_errors(
     """
     Compute standard errors for OLS/IV coefficients.
     
-    Parameters
-    ----------
-    XtX_inv : np.ndarray
-        Inverse of X'X matrix (k, k)
-    resid : np.ndarray
-        Residuals (n,)
-    n_obs : int
-        Number of observations
-    df_resid : int
-        Residual degrees of freedom
-    vcov : str
-        Type of variance estimator: "iid", "HC1", or "cluster"
-    X : np.ndarray
-        Regressor matrix (n, k) - use X_hat for IV
-    weights : np.ndarray, optional
-        Regression weights (n,)
-    cluster_ids : np.ndarray, optional
-        Cluster identifiers (n,) - required for vcov="cluster"
-    ssc : bool
-        Small sample correction for clustered SEs
-        
-    Returns
-    -------
-    tuple
-        (se, n_clusters) where se is standard errors and n_clusters is cluster count (or None)
+    Multi-way clustering uses the Cameron-Gelbach-Miller (2011) approach:
+    For 2-way: V = V1 + V2 - V12
+    For 3-way: V = V1 + V2 + V3 - V12 - V13 - V23 + V123
     """
     n_clusters = None
     
@@ -235,45 +294,25 @@ def compute_standard_errors(
         if cluster_ids is None:
             raise ValueError("cluster_ids required for vcov='cluster'")
         
-        # Get unique clusters and build cluster mapping
-        unique_clusters, cluster_map = np.unique(cluster_ids, return_inverse=True)
-        n_clusters = len(unique_clusters)
-        k = X.shape[1]
-        
-        # VECTORIZED: Build sparse cluster indicator matrix W_C (n_obs x n_clusters)
-        # W_C[i, g] = 1 if observation i belongs to cluster g
-        from scipy import sparse
-        W_C = sparse.csr_matrix(
-            (np.ones(n_obs), (np.arange(n_obs), cluster_map)),
-            shape=(n_obs, n_clusters)
-        )
-        
-        # Compute scores: X_resid = X * resid (element-wise), then aggregate by cluster
-        # scores = W_C.T @ X_resid  (n_clusters x k)
-        if weights is not None:
-            X_resid = X * (resid * weights)[:, np.newaxis]
+        # Check if multi-way clustering (cluster_ids is 2D array)
+        if cluster_ids.ndim == 2:
+            vcov_matrix = _multiway_cluster_vcov(
+                XtX_inv, resid, X, weights, cluster_ids, n_obs, df_resid, ssc
+            )
+            n_clusters = tuple(len(np.unique(cluster_ids[:, i])) for i in range(cluster_ids.shape[1]))
         else:
-            X_resid = X * resid[:, np.newaxis]
+            # Single-way clustering
+            vcov_matrix = _oneway_cluster_vcov(
+                XtX_inv, resid, X, weights, cluster_ids, n_obs, df_resid, ssc
+            )
+            n_clusters = len(np.unique(cluster_ids))
         
-        scores = (W_C.T @ X_resid)  # (n_clusters x k)
-        
-        # Meat matrix: S'S
-        meat = scores.T @ scores
-        
-        # Cluster adjustment
-        if ssc:
-            adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
-        else:
-            adjustment = n_clusters / (n_clusters - 1)
-        
-        vcov_matrix = XtX_inv @ meat @ XtX_inv * adjustment
         se = np.sqrt(np.diag(vcov_matrix))
         
     else:
         raise ValueError(f"vcov must be 'iid', 'HC1', or 'cluster', got '{vcov}'")
     
     return se, n_clusters
-
 
 def build_result(
     x_cols: list[str],

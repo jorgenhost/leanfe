@@ -190,6 +190,7 @@ class DuckDBResult:
 def estimate_compression_ratio(
     x_cols: list[str],
     fe_cols: list[str],
+    table_ref: str | None = None,
     data: str | pl.LazyFrame | None = None,
     con: DuckDBPyConnection | None = None,
 ) -> float:
@@ -230,8 +231,6 @@ def estimate_compression_ratio(
         return 1.0
 
     if con is not None:
-        # If data is a path, we query the file directly; otherwise use 'raw_data' view
-        table_ref = 'data'        
         # 1. Total rows
         res = con.execute(f"SELECT COUNT(*)::BIGINT FROM {table_ref}").fetchone()
         if res is None:
@@ -263,6 +262,7 @@ def compress_duckdb(
     y_col: str,
     x_cols: list[str],
     fe_cols: list[str],
+    table_ref: str,
     weights: str | None = None,
     cluster_col: str | None = None
 ) -> tuple[DuckDBResult, int]:
@@ -298,7 +298,7 @@ def compress_duckdb(
         group_cols = group_cols + [cluster_col]
     
     group_cols_sql = ", ".join(group_cols)
-    res = con.execute("SELECT COUNT(*) FROM data").fetchone()
+    res = con.execute(f"SELECT COUNT(*) FROM {table_ref}").fetchone()
     if res is None:
         raise RuntimeError("Query failed to return a count.")
     n_obs_original = int(res[0])
@@ -312,7 +312,7 @@ def compress_duckdb(
             SUM(POWER({y_col}, 2) * {weights}) AS _sum_y_sq,
             SUM({y_col} * {weights}) / SUM({weights}) AS _mean_y,
             SQRT(SUM({weights})) AS _wts
-        FROM data
+        FROM {table_ref}
         GROUP BY {group_cols_sql}
         """
     else:
@@ -324,7 +324,7 @@ def compress_duckdb(
             SUM(POWER({y_col}, 2)) AS _sum_y_sq,
             SUM({y_col}) / COUNT(*) AS _mean_y,
             SQRT(COUNT(*)) AS _wts
-        FROM data
+        FROM {table_ref}
         GROUP BY {group_cols_sql}
         """
     
@@ -835,6 +835,7 @@ def leanfe_compress_duckdb(
     y_col: str,
     x_cols: list[str],
     fe_cols: list[str],
+    table_ref: str,
     weights: str | None = None,
     vcov: str = "iid",
     cluster_col: str | None = None,
@@ -876,11 +877,13 @@ def leanfe_compress_duckdb(
     """
     # Compress data
     compressed, n_obs = compress_duckdb(
-        con, y_col, x_cols, fe_cols, weights,
+        con, y_col, x_cols, fe_cols, table_ref, weights, 
         cluster_col=cluster_col if vcov.lower() == "cluster" else None
     )
+
     n_compressed = len(compressed)
-    
+    compression_ratio = (n_compressed/n_obs)    
+
     # Build design matrix - all_cols now includes '(Intercept)'
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
         compressed, x_cols, fe_cols
@@ -930,6 +933,7 @@ def leanfe_compress_duckdb(
         std_errors=dict(zip(x_cols, se_x)),
         n_compressed = n_compressed,
         n_obs=n_obs,
+        compression_ratio = compression_ratio,
         vcov_type=vcov,
         df_resid=df_resid,
         rss=rss_total,

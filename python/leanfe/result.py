@@ -47,12 +47,13 @@ class LeanFEResult:
         coefficients: dict[str, float],
         std_errors: dict[str, float],
         n_obs: int,
-        vcov_type: str,            
+        vcov_type: str,           
         iterations: int = 0,
-        n_compressed: int | None = None,       
+        n_compressed: int | None = None,
+        compression_ratio: float | None = None,       
         is_iv: bool = False,       
         n_instruments: int | None = None,
-        n_clusters: int | None = None,
+        n_clusters: int | tuple[int] | None = None,
         df_resid: int | None = None,
         r_squared: float | None = None,
         r_squared_within: float | None = None,
@@ -65,6 +66,8 @@ class LeanFEResult:
         self.std_errors = std_errors
         self.n_obs = n_obs
         self.iterations = iterations
+        self.n_compressed  = n_compressed
+        self.compression_ratio = compression_ratio
         self.vcov_type = vcov_type
         self.is_iv = is_iv
         self.n_instruments = n_instruments
@@ -109,8 +112,7 @@ class LeanFEResult:
     def __repr__(self) -> str:
         """Short representation."""
         n_coef = len(self.coefficients)
-        return f"LeanFEResult(n_obs={self.n_obs:,}, n_coef={n_coef}, vcov='{self.vcov_type}')"
-    
+        return f"LeanFEResult(n_obs={self.n_obs:_}, n_coef={n_coef}, vcov='{self.vcov_type}')"    
     def __str__(self) -> str:
         """Formatted regression table output."""
         lines = []
@@ -124,9 +126,12 @@ class LeanFEResult:
         # Model info
         if self.formula:
             lines.append(f"Formula:      {self.formula}")
-        lines.append(f"Observations: {self.n_obs:,}")
+            lines.append(f"Observations: {self.n_obs:_}")        
         if self.fe_cols:
             lines.append(f"Fixed Effects: {', '.join(self.fe_cols)}")
+        if isinstance(self.fe_cols, dict):
+            for fe, count in self.fe_cols.items():
+                lines.append(f"Fixed Effect ({fe}): {count:_} groups")
         if self.r_squared_within is not None:
             lines.append(f"R² (within):  {self.r_squared_within:.4f}")
         lines.append(f"Std. Errors:  {self._vcov_description()}")
@@ -218,24 +223,28 @@ class LeanFEResult:
             se = self.std_errors[var]
             ci[var] = (coef - t_crit * se, coef + t_crit * se)
         return ci
-    
+
+
     def to_dict(self) -> dict:
-        """Convert to dictionary (for backwards compatibility)."""
+        """Convert to dictionary with visual underscores for integers."""
         return {
+            'formula': self.formula,
             'coefficients': self.coefficients,
             'std_errors': self.std_errors,
             't_stats': self.t_stats,
             'p_values': self.p_values,
-            'n_obs': self.n_obs,
+            'n_obs': wrap_int(self.n_obs),
+            'n_compressed': wrap_int(self.n_compressed),
+            'compression_ratio': self.compression_ratio,
+            'fe_cols': self.fe_cols,
             'iterations': self.iterations,
             'vcov_type': self.vcov_type,
             'is_iv': self.is_iv,
             'n_instruments': self.n_instruments,
-            'n_clusters': self.n_clusters,
-            'df_resid': self.df_resid,
+            'n_clusters': wrap_int(self.n_clusters),
+            'df_resid': wrap_int(self.df_resid),
             'r_squared_within': self.r_squared_within
-        }
-    
+    }
     # Allow dict-like access for backwards compatibility
     def __getitem__(self, key):
         return self.to_dict()[key]
@@ -255,3 +264,12 @@ class LeanFEResult:
     
     def items(self):
         return self.to_dict().items()
+
+class PrettyInt(int):
+    """An integer that displays with underscores in its representation."""
+    def __repr__(self) -> str:
+        return f"{self:_}"
+
+def wrap_int(val: Any) -> PrettyInt | None:
+    """Safely wraps an integer for display, returning None if the input is None."""
+    return PrettyInt(val) if val is not None else None

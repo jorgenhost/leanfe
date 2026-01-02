@@ -49,10 +49,9 @@ def _expand_factors_duckdb(
             case_parts.append(f"CASE WHEN {var} = '{cat_sql}' THEN 1 ELSE 0 END AS {col_name}")
             dummy_cols.append(col_name)
             
-    # 2. Re-create the table once
     if case_parts:
-        con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT *, {', '.join(case_parts)} FROM {table_name}")
-    
+        # Materialize as TEMPORARY to ensure it stays in RAM/temp-storage
+        con.execute(f"CREATE OR REPLACE TEMPORARY TABLE {table_name} AS SELECT *, {', '.join(case_parts)} FROM {table_name}")
     return dummy_cols
 
 def _expand_interactions_duckdb(
@@ -200,18 +199,26 @@ def leanfe_duckdb(
     if weights is not None and weights not in needed_cols:
         needed_cols.append(weights)
     
-    col_list = ', '.join(needed_cols)
-
+    col_list = ', '.join([f'"{c}"' for c in needed_cols])
+    where_parts = [f'"{col}" IS NOT NULL' for col in needed_cols]
+    if weights is not None:
+        where_parts.append(f'"{weights}" > 0') # Weights must be positive
+    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    # If sampling requested, do it in the same CREATE to avoid extra copies
     if isinstance(data, str):
-        # If sampling requested, do it in the same CREATE to avoid extra copies
         if sample_frac is not None:
             pct = sample_frac * 100
             sql = (
                 f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
-                f"SELECT {col_list} FROM read_parquet('{data}') USING SAMPLE {pct}%"
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause} USING SAMPLE {pct}%"
             )
         else:
-            sql = f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS SELECT {col_list} FROM read_parquet('{data}')"
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause}"
+            )
         con.execute(sql)
 
     elif isinstance(data, pl.DataFrame):
@@ -235,7 +242,7 @@ def leanfe_duckdb(
     if interactions:
         new_cols = _expand_interactions_duckdb(
             con = con,
-            table_name = 'tmp_table',
+            table_name = tmp_table,
             interactions = interactions
         )
         x_cols = x_cols + new_cols
@@ -244,7 +251,7 @@ def leanfe_duckdb(
     if factor_vars:
         new_cols = _expand_factors_duckdb(
             con = con,
-            table_name = 'tmp_table',
+            table_name = tmp_table,
             factor_vars = factor_vars
         )
         x_cols = x_cols + new_cols
@@ -255,7 +262,7 @@ def leanfe_duckdb(
     # Compute FE cardinality to decide strategy
     fe_cardinality = {}
     for fe in fe_cols:
-        card_query = f"SELECT COUNT(DISTINCT {fe}) FROM data"
+        card_query = f"SELECT COUNT(DISTINCT {fe}) FROM {tmp_table}"
 
         card = con.execute(card_query).fetchone()
         if card is None:
@@ -263,7 +270,7 @@ def leanfe_duckdb(
         card = int(card[0])
         fe_cardinality[fe] = card
     
-    n_obs_initial_query = "SELECT COUNT(*) FROM data"
+    n_obs_initial_query = f"SELECT COUNT(*) FROM {tmp_table}"
     n_obs_initial = con.execute(n_obs_initial_query).fetchone()
 
     if n_obs_initial is None:
@@ -272,12 +279,12 @@ def leanfe_duckdb(
 
     est_comp_ratio = estimate_compression_ratio(
             con = con,
+            table_ref = f'{tmp_table}',
             x_cols = x_cols,
             fe_cols = fe_cols
     )
 
     if strategy == 'auto':
-
 
         inferred_strategy = determine_strategy(
             vcov, is_iv, fe_cardinality,
@@ -302,6 +309,7 @@ def leanfe_duckdb(
             y_col=y_col,
             x_cols=x_cols,
             fe_cols=fe_cols,
+            table_ref = tmp_table,
             weights=weights,
             vcov=vcov,
             cluster_col=cluster_col,
@@ -318,10 +326,9 @@ def leanfe_duckdb(
         print('Using FWL/alternating projections strategy...')
         # Fall back to FWL demeaning for cluster SEs or IV
         # Drop singletons
-        fe_filter = " OR ".join([f"{fe} IN (SELECT {fe} FROM data GROUP BY 1 HAVING COUNT(*) = 1)" for fe in fe_cols])        
-        con.execute(f"DELETE FROM data WHERE {fe_filter}")
-        
-        n_obs_query = "SELECT COUNT(*) FROM data"
+        fe_filter = " OR ".join([f'"{fe}" IN (SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1)' for fe in fe_cols])
+        con.execute(f'DELETE FROM "{tmp_table}" WHERE {fe_filter}')        
+        n_obs_query = "SELECT COUNT(*) FROM {tmp_table}"
         n_obs_res = con.execute(n_obs_query).fetchone()
 
         if n_obs_res is None:
@@ -336,7 +343,7 @@ def leanfe_duckdb(
         select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
         all_cols = ", ".join(cols_to_keep)
 
-        con.execute(f"CREATE OR REPLACE TEMP TABLE data AS SELECT {all_cols}, {select_dm} FROM data")        
+        con.execute(f"CREATE OR REPLACE TEMP TABLE data AS SELECT {all_cols}, {select_dm} FROM {tmp_table}")        
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
 
@@ -346,7 +353,7 @@ def leanfe_duckdb(
         convergence_sql = f"""
             SELECT MAX(ABS(val)) 
             FROM (
-                SELECT {avg_exprs} FROM data GROUP BY GROUPING SETS ({fe_list})
+                SELECT {avg_exprs} FROM {tmp_table} GROUP BY GROUPING SETS ({fe_list})
             ) UNPIVOT(val FOR col IN ({avg_names}))
         """
 
@@ -360,7 +367,7 @@ def leanfe_duckdb(
                 else:
                     agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
 
-                con.execute(f"CREATE OR REPLACE TEMP TABLE fe_means AS SELECT {fe}, {agg_expr} FROM data GROUP BY {fe}")
+                con.execute(f"CREATE OR REPLACE TEMP TABLE fe_means AS SELECT {fe}, {agg_expr} FROM {tmp_table} GROUP BY {fe}")
 
                 subtract_expr = ", ".join([f"d.{c} - COALESCE(m.{c}_mean, 0) as {c}" for c in dm_cols])
                 other_cols_str = ", ".join([f"d.{c}" for c in cols_to_keep])
@@ -368,7 +375,7 @@ def leanfe_duckdb(
                 con.execute(f"""
                     CREATE OR REPLACE TEMP TABLE data AS 
                     SELECT {other_cols_str}, {subtract_expr}
-                    FROM data d
+                    FROM {tmp_table} d
                     LEFT JOIN fe_means m ON d.{fe} = m.{fe}
                 """)
             if it >= 3:
@@ -392,7 +399,7 @@ def leanfe_duckdb(
         if cluster_cols is not None:
             select_cols.extend(cluster_cols)
         
-        result_df = con.execute(f"SELECT {', '.join(select_cols)} FROM data").pl()
+        result_df = con.execute(f"SELECT {', '.join(select_cols)} FROM {tmp_table}").pl()
         Y = result_df[f"{y_col}_dm"].to_numpy()
         X = result_df[[f"{col}_dm" for col in x_cols]].to_numpy()
         Z = result_df[[f"{col}_dm" for col in instruments]].to_numpy()
@@ -412,7 +419,7 @@ def leanfe_duckdb(
                 cj = x_cols[j]
                 agg_exprs.append(f"SUM({ci}_dm * {cj}_dm) AS xtx_{i}_{j}")
 
-        sql = f"SELECT {', '.join(agg_exprs)} FROM data"
+        sql = f"SELECT {', '.join(agg_exprs)} FROM {tmp_table}"
         row = con.execute(sql).fetchone()
         if row is None:
             raise ValueError("Failed to compute XtX/X'y in a single query")
@@ -433,20 +440,19 @@ def leanfe_duckdb(
 
         beta = np.linalg.solve(XtX, Xty)
         
-        resid_expr = f"{y_col}_dm - (" + " + ".join([f"{b} * {col}_dm" for b, col in zip(beta, x_cols)]) + ")"
-        con.execute("ALTER TABLE data ADD COLUMN _resid DOUBLE")
-        con.execute(f"UPDATE data SET _resid = {resid_expr}")
-    
+        resid_expr = f'"{y_col}_dm" - (' + " + ".join([f"{b} * \"{col}_dm\"" for b, col in zip(beta, x_cols)]) + ")"
+        con.execute(f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"')    
     # Degrees of freedom
     distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
-    distinct_fes = con.execute(f"SELECT {distinct_fes_query} FROM data").fetchone()
-    if distinct_fes is not None:
-        n_fe_groups = sum(distinct_fes)
+    n_fe_groups = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
+    if n_fe_groups is not None:
+        n_fe_groups = sum(n_fe_groups)
     else:   
         n_fe_groups = 0
+        
     absorbed_df = n_fe_groups - len(fe_cols)
     df_resid = n_obs - k - absorbed_df
-    
+
     # Compute XtX_inv
     if is_iv:
         if w is not None:
@@ -481,12 +487,12 @@ def leanfe_duckdb(
         n_clusters = None
         if vcov == "iid":
             if weights is not None:
-                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()
+                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()
                 if sigma2 is None:
                     raise ValueError('Could not compute sigma²')
                 sigma2 = sigma2[0]
             else:
-                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()
+                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()
                 if sigma2 is None:
                     raise ValueError('Could not compute sigma²')
                 sigma2 = sigma2[0]
@@ -502,7 +508,7 @@ def leanfe_duckdb(
                     if weights is not None:
                         expr = f"SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid)"
                     meat_elements.append(f"{expr} AS m_{i}_{j}")
-            meat_row = con.execute(f"SELECT {', '.join(meat_elements)} FROM data").fetchone()
+            meat_row = con.execute(f"SELECT {', '.join(meat_elements)} FROM {tmp_table}").fetchone()
             if meat_row is None:
                 raise ValueError('Could not compute meat row')
             vals = list(meat_row)
@@ -518,46 +524,104 @@ def leanfe_duckdb(
         elif vcov == "cluster":
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
-            # 1. Handle multi-way clustering by creating a unique ID
-            cluster_id_sql = (
-                cluster_cols[0] if len(cluster_cols) == 1 
-                else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
-            )            
-            if weights is not None:
-                score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" for i, col in enumerate(x_cols)]
-            else:
-                score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" for i, col in enumerate(x_cols)]
             
-            cluster_query = f"""
+            if len(cluster_cols) == 1:
+                # Single-way clustering
+                cluster_id_sql = cluster_cols[0]
+                
+                if weights is not None:
+                    score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" 
+                                for i, col in enumerate(x_cols)]
+                else:
+                    score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" 
+                                for i, col in enumerate(x_cols)]
+                
+                cluster_query = f"""
                     SELECT {cluster_id_sql} AS cluster_id, {', '.join(score_exprs)} 
-                    FROM data 
+                    FROM {tmp_table} 
                     GROUP BY 1
                 """
-            score_df = con.execute(cluster_query).pl()
-            n_clusters = len(score_df)
-            S = score_df.select(pl.col([
-                f"score_{i}" for i in range(k)
-            ])).to_numpy()
-            meat = S.T @ S
-            adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) if ssc else n_clusters / (n_clusters - 1)
-            vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
-            se = np.sqrt(np.diag(vcov_matrix))
+                score_df = con.execute(cluster_query).pl()
+                n_clusters = len(score_df)
+                
+                S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
+                meat = S.T @ S
+                
+                adj = ((n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) 
+                    if ssc else n_clusters / (n_clusters - 1))
+                vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
+                se = np.sqrt(np.diag(vcov_matrix))
+                
+            else:
+                # Multi-way clustering using Cameron-Gelbach-Miller (2011)
+                from itertools import combinations
+                
+                n_ways = len(cluster_cols)
+                vcov_matrix = np.zeros_like(XtX_inv)
+                n_clusters_list = []
+                
+                # Iterate over all non-empty subsets with alternating signs
+                for subset_size in range(1, n_ways + 1):
+                    sign = (-1) ** (subset_size - 1)
+                    
+                    for cluster_subset in combinations(range(n_ways), subset_size):
+                        # Build intersection cluster ID
+                        if subset_size == 1:
+                            cluster_id_sql = cluster_cols[cluster_subset[0]]
+                        else:
+                            # Concatenate for intersection
+                            cols_to_concat = [cluster_cols[i] for i in cluster_subset]
+                            cluster_id_sql = f"CONCAT_WS('_', {', '.join(cols_to_concat)})"
+                        
+                        # Compute scores for this clustering dimension
+                        if weights is not None:
+                            score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" 
+                                        for i, col in enumerate(x_cols)]
+                        else:
+                            score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" 
+                                        for i, col in enumerate(x_cols)]
+                        
+                        cluster_query = f"""
+                            SELECT {cluster_id_sql} AS cluster_id, {', '.join(score_exprs)} 
+                            FROM {tmp_table} 
+                            GROUP BY 1
+                        """
+                        score_df = con.execute(cluster_query).pl()
+                        n_clust = len(score_df)
+                        
+                        # Store cluster counts for first-level clusters
+                        if subset_size == 1:
+                            n_clusters_list.append(n_clust)
+                        
+                        S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
+                        meat = S.T @ S
+                        
+                        # Adjustment factor
+                        adj = ((n_clust / (n_clust - 1)) * ((n_obs - 1) / df_resid) 
+                            if ssc else n_clust / (n_clust - 1))
+                        
+                        # Add/subtract with alternating signs
+                        vcov_matrix += sign * adj * XtX_inv @ meat @ XtX_inv
+                
+                se = np.sqrt(np.diag(vcov_matrix))
+                n_clusters = tuple(n_clusters_list)  # Return as tuple for multi-way
+
         else:
             raise ValueError(f"Unknown vcov: {vcov}")
-
-    # Let's not kill the users connection, but only drop the views/tables we used
-    def drop_all_objects(con):
-        # 1. Drop all Views first (to avoid dependency issues)
-        views = con.execute("SELECT view_name FROM duckdb_views WHERE NOT internal").fetchall()
-        for (view_name,) in views:
-            con.execute(f'DROP VIEW IF EXISTS "{view_name}"')
             
-        # 2. Drop all Tables
-        tables = con.execute("SELECT table_name FROM duckdb_tables WHERE NOT internal").fetchall()
-        for (table_name,) in tables:
-            con.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')    
+    def safe_cleanup(con, uid_prefix):
+        """Only drops objects created by this specific LeanFE execution."""
+        # Clean up tables/views starting with our unique ID
+        for obj_type in ["TABLE", "VIEW"]:
+            names = con.execute(f"SELECT {obj_type.lower()}_name FROM duckdb_{obj_type.lower()}s WHERE {obj_type.lower()}_name LIKE 'leanfe_%_{uid_prefix}'").fetchall()
+            for (name,) in names:
+                con.execute(f"DROP {obj_type} IF EXISTS \"{name}\" CASCADE")
+        # Specifically drop the fixed names used in loops
+        con.execute("DROP TABLE IF EXISTS fe_means")
 
-    drop_all_objects(con)
+    # Call this at the end
+    safe_cleanup(con, uid)
+
     return LeanFEResult(
         coefficients=dict(zip(x_cols, beta)), 
         std_errors=dict(zip(x_cols, se)),     
