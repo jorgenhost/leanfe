@@ -293,24 +293,37 @@ def leanfe_duckdb(
         print('Using FWL/alternating projections strategy...')
         # Fall back to FWL demeaning for cluster SEs or IV
         # Drop singletons
-        for fe in fe_cols:
-            con.execute(f"DELETE FROM data WHERE {fe} IN (SELECT {fe} FROM data GROUP BY {fe} HAVING COUNT(*) = 1)")
+        fe_filter = " OR ".join([f"{fe} IN (SELECT {fe} FROM data GROUP BY 1 HAVING COUNT(*) = 1)" for fe in fe_cols])        
+        con.execute(f"DELETE FROM data WHERE {fe_filter}")
         
         n_obs_query = "SELECT COUNT(*) FROM data"
         n_obs_res = con.execute(n_obs_query).fetchone()
+
         if n_obs_res is None:
             raise ValueError('Error in fetching no of obs/rows')
         n_obs = int(n_obs_res[0])
         cols_to_demean = [y_col] + x_cols + instruments
+        cols_to_keep = cols_to_demean + fe_cols
         
+        dm_cols = [f"{col}_dm" for col in cols_to_demean]
+
+        # We create the _dm columns as simple aliases of the originals
+        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
+        all_cols = ", ".join(cols_to_keep)
+
+        con.execute(f"CREATE OR REPLACE TEMP TABLE data AS SELECT {all_cols}, {select_dm} FROM data")        
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        alter_statements = [f"ALTER TABLE data ADD COLUMN {col}_dm DOUBLE" for col in cols_to_demean]
-        con.execute("; ".join(alter_statements))
 
-        # Initialize demeaned columns in one UPDATE
-        update_cols = ", ".join([f"{col}_dm = {col}" for col in cols_to_demean])
-        con.execute(f"UPDATE data SET {update_cols}")
+        avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
+        avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
+        fe_list = ", ".join(fe_cols)
+        convergence_sql = f"""
+            SELECT MAX(ABS(val)) 
+            FROM (
+                SELECT {avg_exprs} FROM data GROUP BY GROUPING SETS ({fe_list})
+            ) UNPIVOT(val FOR col IN ({avg_names}))
+        """
 
         dm_cols = [f"{col}_dm" for col in cols_to_demean]
         
@@ -318,52 +331,29 @@ def leanfe_duckdb(
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
                 if weights is not None:
-                    mean_cols = ", ".join([f"SUM({col} * {weights}) / SUM({weights}) as mean_{col}" 
-                                        for col in dm_cols])
-                    con.execute(f"""
-                        CREATE OR REPLACE TEMP TABLE fe_means AS
-                        SELECT {fe}, {mean_cols}
-                        FROM data
-                        GROUP BY {fe}
-                    """)
-                    
-                    update_expr = ", ".join([f"{col} = {col} - fe_means.mean_{col}" for col in dm_cols])
-                    con.execute(f"""
-                        UPDATE data 
-                        SET {update_expr}
-                        FROM fe_means 
-                        WHERE data.{fe} = fe_means.{fe}
-                    """)
+                    agg_expr = ", ".join([f"SUM({c} * {weights}) / SUM({weights}) as {c}_mean" for c in dm_cols])
                 else:
-                    mean_cols = ", ".join([f"AVG({col}) as mean_{col}" for col in dm_cols])
-                    con.execute(f"""
-                        CREATE OR REPLACE TEMP TABLE fe_means AS
-                        SELECT {fe}, {mean_cols}
-                        FROM data
-                        GROUP BY {fe}
-                    """)
-                    
-                    # Update all columns in one statement
-                    update_expr = ", ".join([f"{col} = {col} - fe_means.mean_{col}" for col in dm_cols])
-                    con.execute(f"""
-                        UPDATE data 
-                        SET {update_expr}
-                        FROM fe_means 
-                        WHERE data.{fe} = fe_means.{fe}
-                    """)
-            
+                    agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
+
+                con.execute(f"CREATE OR REPLACE TEMP TABLE fe_means AS SELECT {fe}, {agg_expr} FROM data GROUP BY {fe}")
+
+                subtract_expr = ", ".join([f"d.{c} - COALESCE(m.{c}_mean, 0) as {c}" for c in dm_cols])
+                other_cols_str = ", ".join([f"d.{c}" for c in cols_to_keep])
+
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE data AS 
+                    SELECT {other_cols_str}, {subtract_expr}
+                    FROM data d
+                    LEFT JOIN fe_means m ON d.{fe} = m.{fe}
+                """)
             if it >= 3:
-                check_cols = " UNION ALL ".join([
-                    f"SELECT {fe} as fe_col, '{col}' as dm_col, AVG({col}) as avg_val FROM data GROUP BY {fe}"
-                    for fe in fe_cols for col in dm_cols
-                ])
-                result = con.execute(f"""
-                    SELECT MAX(ABS(avg_val)) FROM ({check_cols})
-                """).fetchone()
-                if result is None:
-                        raise ValueError('Error in iterative demeaning')
-                result = result[0]
-                if abs(result or 0) < demean_tol:
+                max_err = con.execute(f"""
+                    {convergence_sql}
+                """).fetchone()               
+                if max_err is None:
+                    raise ValueError('Error in iterative demeaning')
+                max_err = max_err[0]
+                if abs(max_err or 0) < demean_tol:
                     break
     
     k = len(x_cols)
