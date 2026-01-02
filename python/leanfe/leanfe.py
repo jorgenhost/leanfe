@@ -23,7 +23,7 @@ def leanfe(
     max_iter: int = 500,
     vcov: str = "iid",
     cluster_cols: list[str] | None = None,
-    ssc: bool = False,
+    ssc: bool = True,
     sample_frac: float | None = None,
     backend: Literal["polars", "duckdb"] = "polars",
     con: DuckDBPyConnection | None = None

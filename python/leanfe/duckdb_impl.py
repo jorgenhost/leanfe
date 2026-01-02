@@ -324,41 +324,40 @@ def leanfe_duckdb(
 
     if strategy == 'alt_proj':
         print('Using FWL/alternating projections strategy...')
-        # Fall back to FWL demeaning for cluster SEs or IV
-        # Drop singletons
+        # Drop singletons (same as before)
         fe_filter = " OR ".join([f'"{fe}" IN (SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1)' for fe in fe_cols])
-        con.execute(f'DELETE FROM "{tmp_table}" WHERE {fe_filter}')        
-        n_obs_query = "SELECT COUNT(*) FROM {tmp_table}"
+        con.execute(f'DELETE FROM "{tmp_table}" WHERE {fe_filter}')
+        n_obs_query = f'SELECT COUNT(*) FROM "{tmp_table}"'
         n_obs_res = con.execute(n_obs_query).fetchone()
 
         if n_obs_res is None:
             raise ValueError('Error in fetching no of obs/rows')
         n_obs = int(n_obs_res[0])
+
+        # Columns to demean and columns to keep IN THE WORKING TABLE.
         cols_to_demean = [y_col] + x_cols + instruments
+        # Include fe_cols + cluster_cols + weights so they are available later
         cols_to_keep = cols_to_demean + fe_cols
-        
-        dm_cols = [f"{col}_dm" for col in cols_to_demean]
+        if cluster_cols is not None:
+            for c in cluster_cols:
+                if c not in cols_to_keep:
+                    cols_to_keep.append(c)
+        if weights is not None and weights not in cols_to_keep:
+            cols_to_keep.append(weights)
 
-        # We create the _dm columns as simple aliases of the originals
+        # Create a dedicated working table so we consistently read/write the same table
+        work_table = mk_tmp("work")
+        # create _dm aliases for demeaned cols
         select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
-        all_cols = ", ".join(cols_to_keep)
+        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
+        con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
+        # reassign tmp_table to the working table for the remainder of the function
+        tmp_table = work_table
 
-        con.execute(f"CREATE OR REPLACE TEMP TABLE data AS SELECT {all_cols}, {select_dm} FROM {tmp_table}")        
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-
-        avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
-        avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
-        fe_list = ", ".join(fe_cols)
-        convergence_sql = f"""
-            SELECT MAX(ABS(val)) 
-            FROM (
-                SELECT {avg_exprs} FROM {tmp_table} GROUP BY GROUPING SETS ({fe_list})
-            ) UNPIVOT(val FOR col IN ({avg_names}))
-        """
-
         dm_cols = [f"{col}_dm" for col in cols_to_demean]
-        
+
         # Iterative demeaning
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
@@ -367,27 +366,39 @@ def leanfe_duckdb(
                 else:
                     agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
 
-                con.execute(f"CREATE OR REPLACE TEMP TABLE fe_means AS SELECT {fe}, {agg_expr} FROM {tmp_table} GROUP BY {fe}")
+                con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_expr} FROM "{tmp_table}" GROUP BY 1')
 
-                subtract_expr = ", ".join([f"d.{c} - COALESCE(m.{c}_mean, 0) as {c}" for c in dm_cols])
-                other_cols_str = ", ".join([f"d.{c}" for c in cols_to_keep])
+                # ensure we keep cluster and weight columns in the SELECT list when rebuilding tmp_table
+                other_cols_str = ", ".join([f'd."{c}"' for c in cols_to_keep])
+                subtract_expr = ", ".join([f'd.{c} - COALESCE(m.{c}_mean, 0) as {c}' for c in dm_cols])
 
                 con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE data AS 
+                    CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS 
                     SELECT {other_cols_str}, {subtract_expr}
-                    FROM {tmp_table} d
-                    LEFT JOIN fe_means m ON d.{fe} = m.{fe}
+                    FROM "{tmp_table}" d
+                    LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
                 """)
             if it >= 3:
-                max_err = con.execute(f"""
-                    {convergence_sql}
-                """).fetchone()               
+                # compute convergence on the working table
+                avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
+                avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
+                fe_list = ", ".join([f'"{fe}"' for fe in fe_cols])
+                convergence_sql = f"""
+                    SELECT MAX(ABS(val)) 
+                    FROM (
+                        SELECT {avg_exprs} FROM "{tmp_table}" GROUP BY GROUPING SETS ({fe_list})
+                    ) UNPIVOT(val FOR col IN ({avg_names}))
+                """
+                max_err = con.execute(convergence_sql).fetchone()
                 if max_err is None:
                     raise ValueError('Error in iterative demeaning')
                 max_err = max_err[0]
                 if abs(max_err or 0) < demean_tol:
                     break
-    
+
+    # set tmp_table to work_table for the remainder of the function so downstream logic reads the demeaned table
+    tmp_table = work_table
+
     k = len(x_cols)
     is_iv = len(instruments) > 0
     
@@ -471,13 +482,12 @@ def leanfe_duckdb(
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
             if len(cluster_cols) == 1:
-                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy()
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy().flatten()
             else:
                 cluster_ids = (
-                    result_df.select(
-                        pl.concat_str([pl.col(c).cast(pl.String) for c in cluster_cols], separator="_").cast(pl.Categorical).to_physical()
-                    )
-                    .to_numpy()
+                    result_df.select(pl.col([
+                        c for c in cluster_cols
+                    ])).to_numpy()
                 )        
         se, n_clusters = compute_standard_errors(
             XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
@@ -589,6 +599,13 @@ def leanfe_duckdb(
                         score_df = con.execute(cluster_query).pl()
                         n_clust = len(score_df)
                         
+                        # Skip subsets with <= 1 cluster
+                        if n_clust <= 1:
+                            # If this is a first-order subset, still record for n_clusters_list
+                            if subset_size == 1:
+                                n_clusters_list.append(n_clust)
+                            continue
+                        
                         # Store cluster counts for first-level clusters
                         if subset_size == 1:
                             n_clusters_list.append(n_clust)
@@ -596,19 +613,19 @@ def leanfe_duckdb(
                         S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
                         meat = S.T @ S
                         
-                        # Adjustment factor
-                        adj = ((n_clust / (n_clust - 1)) * ((n_obs - 1) / df_resid) 
-                            if ssc else n_clust / (n_clust - 1))
+                        # Cluster-count adjustment (only G/(G-1) per component)
+                        adj_g = n_clust / (n_clust - 1)
                         
-                        # Add/subtract with alternating signs
-                        vcov_matrix += sign * adj * XtX_inv @ meat @ XtX_inv
+                        # Add/subtract with alternating signs; do NOT multiply (n_obs-1)/df_resid here
+                        vcov_matrix += sign * adj_g * (XtX_inv @ meat @ XtX_inv)
+                
+                # Apply small-sample df correction once if requested
+                if ssc:
+                    vcov_matrix *= ((n_obs - 1) / df_resid)
                 
                 se = np.sqrt(np.diag(vcov_matrix))
                 n_clusters = tuple(n_clusters_list)  # Return as tuple for multi-way
-
-        else:
-            raise ValueError(f"Unknown vcov: {vcov}")
-            
+                            
     def safe_cleanup(con, uid_prefix):
         """Only drops objects created by this specific LeanFE execution."""
         # Clean up tables/views starting with our unique ID

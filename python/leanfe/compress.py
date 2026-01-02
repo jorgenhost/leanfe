@@ -619,7 +619,8 @@ def compute_se_compress(
     cluster_ids: np.ndarray | None = None,
     e0_g: np.ndarray | None = None,
     ssc: bool = False
-) -> tuple[np.ndarray, int | None]:
+) -> tuple[np.ndarray, int | tuple[int, ...] | None]:
+
     """
     Compute standard errors from compressed data.
     
@@ -682,46 +683,114 @@ def compute_se_compress(
     elif vcov.lower() == "cluster":
         if cluster_ids is None or e0_g is None:
             raise ValueError("cluster_ids and e0_g required for cluster SEs")
-        
-        # Section 5.3.1: Ξ̂ = M̃ᵀ diag(ẽ⁰) W̃_C W̃_Cᵀ diag(ẽ⁰) M̃
-        # Using sparse cluster matrix for efficient aggregation
-        
+
         # Build sparse cluster indicator matrix W̃_C
-        W_C, n_clusters = _build_sparse_cluster_matrix(cluster_ids)
-        
+        W_C, n_clusters_first = _build_sparse_cluster_matrix(cluster_ids)
+        # In compressed case cluster_ids is length G array of cluster ids per group.
+
         # Compute scores per group: diag(ẽ⁰) @ M̃ = X * e0_g[:, None]
         if sparse.issparse(X):
             # X is sparse: multiply each row by corresponding e0_g
             scores_g = X.multiply(e0_g[:, np.newaxis])  # G x p sparse
         else:
             scores_g = sparse.csr_matrix(X * e0_g[:, np.newaxis])  # G x p sparse
-        
-        # Aggregate scores within clusters using sparse matrix multiplication:
-        # cluster_scores = W̃_Cᵀ @ scores_g  (C x p)
-        # This is equivalent to summing scores_g rows within each cluster
-        cluster_scores = W_C.T @ scores_g  # C x p
-        
-        # Meat matrix: cluster_scoresᵀ @ cluster_scores = Σ_c (s_c @ s_c')
-        if sparse.issparse(cluster_scores):
-            meat = (cluster_scores.T @ cluster_scores).toarray()
-        else:
-            meat = cluster_scores.T @ cluster_scores
-        
-        # Small sample correction
-        if ssc:
-            adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
-        else:
-            adjustment = n_clusters / (n_clusters - 1)
-        
-        vcov_matrix = adjustment * XtX_inv @ meat @ XtX_inv
-        se_full = np.sqrt(np.diag(vcov_matrix))
-        
-    else:
-        raise ValueError(f"vcov must be 'iid', 'HC1', or 'cluster', got '{vcov}'")
-    
-    # Return only SEs for x_cols (not FE dummies)
-    return se_full[:k_x], n_clusters
 
+        # We'll build the alternating-sum across all non-empty subsets of clustering dimensions.
+        # For the compressed case we might have only one cluster dimension (cluster_ids is 1D),
+        # but we keep the consistent logic for potential multi-way compressed inputs.
+
+        # If cluster_ids is 1D, we can reuse W_C directly (single-way)
+        if isinstance(cluster_ids, (list, tuple)) or (hasattr(cluster_ids, "ndim") and getattr(cluster_ids, "ndim") == 2):
+            # Multi-way: cluster_ids should be provided as array-like with shape (G, nways)
+            # We'll compute meat components via W_C per subset (constructed above for single-dim)
+            # For compressed multi-way, the caller should pass cluster_ids structured appropriately.
+            # For simplicity we follow the same pattern as in the uncompressed implementation:
+            # sum sign * (XtX_inv @ meat @ XtX_inv) and apply single G_min correction at the end.
+            from itertools import combinations as _combinations
+
+            # Determine number of ways
+            if np.ndim(cluster_ids) == 1:
+                n_ways = 1
+            else:
+                n_ways = cluster_ids.shape[1]
+
+            vcov_matrix = np.zeros_like(XtX_inv)
+            n_clusters_list = []
+
+            for subset_size in range(1, n_ways + 1):
+                sign = (-1) ** (subset_size - 1)
+
+                for cluster_subset in _combinations(range(n_ways), subset_size):
+                    # Build intersection cluster ID
+                    if subset_size == 1:
+                        # cluster_ids can be 2D; take the column
+                        col = cluster_ids[:, cluster_subset[0]]
+                        unique_vals, inverse = np.unique(col, return_inverse=True)
+                        n_clust = len(unique_vals)
+                    else:
+                        # create string concat IDs to compute unique clusters
+                        concat = np.array([
+                            '_'.join(str(cluster_ids[i, j]) for j in cluster_subset)
+                            for i in range(len(cluster_ids))
+                        ])
+                        unique_vals, inverse = np.unique(concat, return_inverse=True)
+                        n_clust = len(unique_vals)
+
+                    if n_clust <= 1:
+                        continue
+
+                    # Keep track of first-order cluster sizes
+                    if subset_size == 1:
+                        n_clusters_list.append(n_clust)
+
+                    # Build sparse W_C for this subset
+                    W_C_sub = sparse.csr_matrix(
+                        (np.ones(len(inverse)), (np.arange(len(inverse)), inverse)),
+                        shape=(len(inverse), n_clust)
+                    )
+
+                    # cluster_scores = W_C_sub.T @ scores_g  (C x p)
+                    cluster_scores = W_C_sub.T @ scores_g
+
+                    if sparse.issparse(cluster_scores):
+                        meat = (cluster_scores.T @ cluster_scores).toarray()
+                    else:
+                        meat = cluster_scores.T @ cluster_scores
+
+                    vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
+
+            # Apply G_min correction once (fixest default) if ssc requested
+            if ssc and len(n_clusters_list) > 0:
+                G_min = min(n_clusters_list)
+                if G_min > 1:
+                    vcov_matrix *= (G_min / (G_min - 1))
+
+            # Apply small-sample K adjustment if requested
+            if ssc:
+                vcov_matrix *= ((n_obs - 1) / df_resid)
+
+            se_full = np.sqrt(np.diag(vcov_matrix))
+            n_clusters = tuple(n_clusters_list) if len(n_clusters_list) > 1 else (n_clusters_list[0],)
+            return se_full[:k_x], n_clusters
+
+        else:
+            # Single-way clustering (existing path)
+            W_C_single, n_clusters = _build_sparse_cluster_matrix(cluster_ids)
+            # cluster_scores = W_C_single.T @ scores_g
+            cluster_scores = W_C_single.T @ scores_g
+            if sparse.issparse(cluster_scores):
+                meat = (cluster_scores.T @ cluster_scores).toarray()
+            else:
+                meat = cluster_scores.T @ cluster_scores
+
+            if ssc:
+                adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
+            else:
+                adjustment = n_clusters / (n_clusters - 1)
+
+            vcov_matrix = adjustment * (XtX_inv @ meat @ XtX_inv)
+            se_full = np.sqrt(np.diag(vcov_matrix))
+            return se_full[:k_x], n_clusters
 
 def leanfe_compress_polars(
     lf: pl.LazyFrame,

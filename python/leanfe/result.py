@@ -53,7 +53,7 @@ class LeanFEResult:
         compression_ratio: float | None = None,       
         is_iv: bool = False,       
         n_instruments: int | None = None,
-        n_clusters: int | tuple[int] | None = None,
+        n_clusters: int | tuple[int, ...] | None = None,
         df_resid: int | None = None,
         r_squared: float | None = None,
         r_squared_within: float | None = None,
@@ -241,7 +241,7 @@ class LeanFEResult:
             'vcov_type': self.vcov_type,
             'is_iv': self.is_iv,
             'n_instruments': self.n_instruments,
-            'n_clusters': wrap_int(self.n_clusters),
+            'n_clusters': self.n_clusters,
             'df_resid': wrap_int(self.df_resid),
             'r_squared_within': self.r_squared_within
     }
