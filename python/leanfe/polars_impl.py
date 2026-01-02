@@ -353,6 +353,7 @@ def leanfe_polars(
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
                 if weights is not None:
+                    # We don't unnecessarily create extra demeaned cols, we keep the same name
                     demean_exprs = [
                         (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) / 
                         pl.col(weights).sum().over(fe)).alias(c)
@@ -454,5 +455,6 @@ def leanfe_polars(
         n_clusters=n_clusters,
         df_resid=df_resid,
         formula=formula,
-        fe_cols=fe_cols
+        fe_cols=fe_cols,
+        r_squared = r_squared_within
     )
