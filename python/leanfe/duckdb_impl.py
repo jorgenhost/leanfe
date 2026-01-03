@@ -5,10 +5,10 @@ Optimized for memory efficiency using in-database operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
 import duckdb
+from duckdb import DuckDBPyConnection
 import numpy as np
 import polars as pl
 import uuid
-from itertools import combinations
 
 from leanfe.result import LeanFEResult
 from leanfe.common import (
@@ -22,6 +22,16 @@ from leanfe.compress import (
     estimate_compression_ratio
 )
 MAX_FE_LEVELS = 10_000
+
+def _safe_cleanup(con, uid_prefix):
+    """Only drops objects created by this specific LeanFE execution."""
+    # Clean up tables/views starting with our unique ID
+    for obj_type in ["TABLE", "VIEW"]:
+        names = con.execute(f"SELECT {obj_type.lower()}_name FROM duckdb_{obj_type.lower()}s WHERE {obj_type.lower()}_name LIKE 'leanfe_%_{uid_prefix}'").fetchall()
+        for (name,) in names:
+            con.execute(f"DROP {obj_type} IF EXISTS \"{name}\" CASCADE")
+    # Specifically drop the fixed names used in loops
+    con.execute("DROP TABLE IF EXISTS fe_means")
 
 def _expand_factors_duckdb(
     con: duckdb.DuckDBPyConnection, 
@@ -105,300 +115,24 @@ def _expand_interactions_duckdb(
 
     return all_new_cols
 
-def leanfe_duckdb(
-    data: str | pl.DataFrame | pl.LazyFrame | None,
-    y_col: str | None = None,
-    x_cols: list[str] | None = None,
-    fe_cols: list[str] | None = None,
-    formula: str | None = None,
-    strategy: str = 'auto',
-    weights: str | None = None,
-    demean_tol: float = 1e-8,
-    max_iter: int = 500,
-    vcov: str = "iid",
-    cluster_cols: list[str] | None = None,
-    ssc: bool = False,
-    sample_frac: float | None = None,
-    con: duckdb.DuckDBPyConnection | None = None
-) -> LeanFEResult:
+def _run_regression_duckdb(
+    con: DuckDBPyConnection,
+    tmp_table: str,
+    y_col: str,
+    x_cols: list[str],
+    instruments: list[str],
+    weights: str | None,
+    vcov: str,
+    cluster_cols: list[str] | None,
+    ssc: bool,
+    n_obs: int,
+    absorbed_df: int = 0
+) -> tuple[np.ndarray, np.ndarray, int, int | tuple | None]:
     """
-    Fixed effects regression using DuckDB with optimized memory usage.
+    Common regression logic for both OLS and FE cases (DuckDB version).
     
-    Parameters
-    ----------
-    data : str or polars.DataFrame
-        Input data: either DataFrame or path to Parquet file
-    y_col : str, optional
-        Dependent variable column name (optional if formula provided)
-    x_cols : list of str, optional
-        Independent variable column names (optional if formula provided)
-    fe_cols : list of str, optional
-        Fixed effect column names (optional if formula provided)
-    formula : str, optional
-        R-style formula: "y ~ x1 + x2 + x:i(factor) | fe1 + fe2 | z1 + z2" (IV)
-    weights : str, optional
-        Column name for regression weights
-    demean_tol : float, default 1e-5
-        Convergence tolerance for demeaning
-    max_iter : int, default 500
-        Maximum iterations for demeaning
-    vcov : str, default "iid"
-        Variance-covariance estimator: "iid", "HC1", or "cluster"
-    cluster_cols : list of str, optional
-        Clustering variables (required if vcov="cluster")
-    ssc : bool, default False
-        Small sample correction for clustered SEs
-    sample_frac : float, optional
-        Fraction of data to sample (e.g., 0.1 for 10%)
-    
-    Returns
-    -------
-    dict
-        coefficients, std_errors, n_obs, iterations, vcov_type, 
-        is_iv, n_instruments, n_clusters
+    Returns: (beta, se, df_resid, n_clusters)
     """
-
-    assert con is not None, "User must provide a duckdb.connect() object."
-
-    # create unique prefix for all temp objects for this call
-    uid = uuid.uuid4().hex[:8]
-    def mk_tmp(name: str) -> str:
-        # safe SQL identifier (no hyphens). We'll quote when used.
-        return f"leanfe_{name}_{uid}"
-
-    tmp_table = mk_tmp("data")  # will become the working table name for this call
-    created_tmp_tables = [tmp_table]  # track for cleanup
-
-    # Parse formula if provided
-    if formula is not None:
-        y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
-    elif y_col is None or x_cols is None or fe_cols is None:
-        raise ValueError("Must provide either 'formula' or (y_col, x_cols, fe_cols)")
-    else:
-        factor_vars = []
-        interactions = []
-        instruments = []
-    
-    # Make lists mutable
-    x_cols = list(x_cols)
-    fe_cols = list(fe_cols)
-    
-    # Build needed columns
-    needed_cols = [y_col] + x_cols + fe_cols + instruments
-    # Add factor variable columns
-    for var, ref in factor_vars:
-        if var not in needed_cols:
-            needed_cols.append(var)
-    # Add interaction variable columns
-    for var, factor, ref in interactions:
-        if var not in needed_cols:
-            needed_cols.append(var)
-        if factor not in needed_cols:
-            needed_cols.append(factor)
-    if cluster_cols is not None:
-        needed_cols += [c for c in cluster_cols if c not in needed_cols]
-    if weights is not None and weights not in needed_cols:
-        needed_cols.append(weights)
-    
-    col_list = ', '.join([f'"{c}"' for c in needed_cols])
-    where_parts = [f'"{col}" IS NOT NULL' for col in needed_cols]
-    if weights is not None:
-        where_parts.append(f'"{weights}" > 0') # Weights must be positive
-    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
-    # If sampling requested, do it in the same CREATE to avoid extra copies
-    if isinstance(data, str):
-        if sample_frac is not None:
-            pct = sample_frac * 100
-            sql = (
-                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
-                f"SELECT {col_list} FROM read_parquet('{data}') "
-                f"{where_clause} USING SAMPLE {pct}%"
-            )
-        else:
-            sql = (
-                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
-                f"SELECT {col_list} FROM read_parquet('{data}') "
-                f"{where_clause}"
-            )
-        con.execute(sql)
-
-    elif isinstance(data, pl.DataFrame):
-        # Register the polars DF under a short ephemeral name, then materialize it
-        src_name = mk_tmp("src")
-        # register the DataFrame as a relation name and then create a TEMP TABLE from it
-        con.register(src_name, data.select(needed_cols))
-        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
-        created_tmp_tables.append(src_name)  # we may try to drop this registered name later (best-effort)
-
-    elif isinstance(data, pl.LazyFrame):
-        df = data.select(needed_cols).collect()
-        src_name = mk_tmp("src")
-        con.register(src_name, df)
-        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
-        created_tmp_tables.append(src_name)
-    else:
-        raise ValueError('Please specify either data or con argument')
-
-    # Handle interactions
-    if interactions:
-        new_cols = _expand_interactions_duckdb(
-            con = con,
-            table_name = tmp_table,
-            interactions = interactions
-        )
-        x_cols = x_cols + new_cols
-
-    # Handle factor variables
-    if factor_vars:
-        new_cols = _expand_factors_duckdb(
-            con = con,
-            table_name = tmp_table,
-            factor_vars = factor_vars
-        )
-        x_cols = x_cols + new_cols
-    # Check if we should use compression strategy (faster for IID/HC1 without IV)
-    # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
-    is_iv = len(instruments) > 0
-    
-    # Compute FE cardinality to decide strategy
-    fe_cardinality = {}
-    for fe in fe_cols:
-        card_query = f"SELECT COUNT(DISTINCT {fe}) FROM {tmp_table}"
-
-        card = con.execute(card_query).fetchone()
-        if card is None:
-            raise ValueError(f'Error in computing FE ({fe}) cardinality, check dtype of {fe} or try different backend')
-        card = int(card[0])
-        fe_cardinality[fe] = card
-    
-    n_obs_initial_query = f"SELECT COUNT(*) FROM {tmp_table}"
-    n_obs_initial = con.execute(n_obs_initial_query).fetchone()
-
-    if n_obs_initial is None:
-        raise ValueError('Could not fetch number of obs/rows. Check for corrupted data')
-    n_obs_initial = int(n_obs_initial[0])
-
-    est_comp_ratio = estimate_compression_ratio(
-            con = con,
-            table_ref = f'{tmp_table}',
-            x_cols = x_cols,
-            fe_cols = fe_cols
-    )
-
-    if strategy == 'auto':
-
-        inferred_strategy = determine_strategy(
-            vcov, is_iv, fe_cardinality,
-            max_fe_levels=MAX_FE_LEVELS,
-            n_obs=n_obs_initial,
-            n_x_cols=len(x_cols),
-            estimated_compression_ratio=est_comp_ratio
-        )
-
-        print(f'Auto strategy: Inferring {inferred_strategy} strategy')
-        strategy = inferred_strategy
-
-    
-    if strategy == 'compress':
-        print('Using compresssion strategy...')
-        # Use YOCO compression strategy - much faster and lower memory
-        # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
-
-        result = leanfe_compress_duckdb(
-            con=con,
-            y_col=y_col,
-            x_cols=x_cols,
-            fe_cols=fe_cols,
-            table_ref = tmp_table,
-            weights=weights,
-            vcov=vcov,
-            cluster_col=cluster_cols,
-            ssc=ssc
-        )
-        
-        # Update attributes directly
-        result.formula = formula
-        result.fe_cols = fe_cols
-
-        return result
-
-    if strategy == 'alt_proj':
-        print('Using FWL/alternating projections strategy...')
-        # Drop singletons (same as before)
-        fe_filter = " OR ".join([f'"{fe}" IN (SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1)' for fe in fe_cols])
-        con.execute(f'DELETE FROM "{tmp_table}" WHERE {fe_filter}')
-        n_obs_query = f'SELECT COUNT(*) FROM "{tmp_table}"'
-        n_obs_res = con.execute(n_obs_query).fetchone()
-
-        if n_obs_res is None:
-            raise ValueError('Error in fetching no of obs/rows')
-        n_obs = int(n_obs_res[0])
-
-        # Columns to demean and columns to keep IN THE WORKING TABLE.
-        cols_to_demean = [y_col] + x_cols + instruments
-        # Include fe_cols + cluster_cols + weights so they are available later
-        cols_to_keep = cols_to_demean + fe_cols
-        if cluster_cols is not None:
-            for c in cluster_cols:
-                if c not in cols_to_keep:
-                    cols_to_keep.append(c)
-        if weights is not None and weights not in cols_to_keep:
-            cols_to_keep.append(weights)
-
-        # Create a dedicated working table so we consistently read/write the same table
-        work_table = mk_tmp("work")
-        # create _dm aliases for demeaned cols
-        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
-        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
-        con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
-        # reassign tmp_table to the working table for the remainder of the function
-        tmp_table = work_table
-
-        # Order FEs by cardinality (low-card first) for faster convergence
-        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        dm_cols = [f"{col}_dm" for col in cols_to_demean]
-
-        # Iterative demeaning
-        for it in range(1, max_iter + 1):
-            for fe in fe_cols_ordered:
-                if weights is not None:
-                    agg_expr = ", ".join([f"SUM({c} * {weights}) / SUM({weights}) as {c}_mean" for c in dm_cols])
-                else:
-                    agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
-
-                con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_expr} FROM "{tmp_table}" GROUP BY 1')
-
-                # ensure we keep cluster and weight columns in the SELECT list when rebuilding tmp_table
-                other_cols_str = ", ".join([f'd."{c}"' for c in cols_to_keep])
-                subtract_expr = ", ".join([f'd.{c} - COALESCE(m.{c}_mean, 0) as {c}' for c in dm_cols])
-
-                con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS 
-                    SELECT {other_cols_str}, {subtract_expr}
-                    FROM "{tmp_table}" d
-                    LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
-                """)
-            if it >= 3:
-                # compute convergence on the working table
-                avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
-                avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
-                fe_list = ", ".join([f'"{fe}"' for fe in fe_cols])
-                convergence_sql = f"""
-                    SELECT MAX(ABS(val)) 
-                    FROM (
-                        SELECT {avg_exprs} FROM "{tmp_table}" GROUP BY GROUPING SETS ({fe_list})
-                    ) UNPIVOT(val FOR col IN ({avg_names}))
-                """
-                max_err = con.execute(convergence_sql).fetchone()
-                if max_err is None:
-                    raise ValueError('Error in iterative demeaning')
-                max_err = max_err[0]
-                if abs(max_err or 0) < demean_tol:
-                    break
-
-    # set tmp_table to work_table for the remainder of the function so downstream logic reads the demeaned table
-    tmp_table = work_table
-
     k = len(x_cols)
     is_iv = len(instruments) > 0
     
@@ -418,8 +152,34 @@ def leanfe_duckdb(
         
         beta, X_hat = iv_2sls(Y, X, Z, w)
         resid = Y - X_hat @ beta
+        
+        # Compute XtX_inv for IV
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            X_hat_w = X_hat * sqrt_w[:, np.newaxis]
+            XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+        else:
+            XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+        
+        # Cluster IDs for SE computation
+        cluster_ids = None
+        if vcov == "cluster":
+            if cluster_cols is None:
+                raise ValueError("cluster_cols required for vcov='cluster'")
+            if len(cluster_cols) == 1:
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy().flatten()
+            else:
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy()
+        
+        df_resid = n_obs - k - absorbed_df
+        
+        se, n_clusters = compute_standard_errors(
+            XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
+            vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
+        )
+        
     else:
-        # build expressions
+        # Build expressions for OLS
         agg_exprs = []
         # X'y
         for i, col in enumerate(x_cols):
@@ -434,7 +194,7 @@ def leanfe_duckdb(
         row = con.execute(sql).fetchone()
         if row is None:
             raise ValueError("Failed to compute XtX/X'y in a single query")
-        vals = list(row)  # tuple -> list
+        vals = list(row)
 
         # Unpack
         idx = 0
@@ -450,52 +210,15 @@ def leanfe_duckdb(
                 idx += 1
 
         beta = np.linalg.solve(XtX, Xty)
-        
-        resid_expr = f'"{y_col}_dm" - (' + " + ".join([f"{b} * \"{col}_dm\"" for b, col in zip(beta, x_cols)]) + ")"
-        con.execute(f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"')    
-    
-
-    # Degrees of freedom
-    distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
-    n_fe_groups = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
-    if n_fe_groups is not None:
-        n_fe_groups = sum(n_fe_groups)
-    else:   
-        n_fe_groups = 0
-        
-    absorbed_df = n_fe_groups - len(fe_cols)
-    df_resid = n_obs - k - absorbed_df
-    
-    # Compute XtX_inv
-    if is_iv:
-        if w is not None:
-            sqrt_w = np.sqrt(w)
-            X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-            XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
-        else:
-            XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
-    else:
         XtX_inv = np.linalg.inv(XtX)
-    
-    # Standard errors
-    if is_iv:
-        cluster_ids = None
-        if vcov == "cluster":
-            if cluster_cols is None:
-                raise ValueError("cluster_cols required for vcov='cluster'")
-            if len(cluster_cols) == 1:
-                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy().flatten()
-            else:
-                cluster_ids = (
-                    result_df.select(pl.col([
-                        c for c in cluster_cols
-                    ])).to_numpy()
-                )        
-        se, n_clusters = compute_standard_errors(
-            XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
-            vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
-        )
-    else:
+        
+        # Compute residuals and store in table
+        resid_expr = f'"{y_col}_dm" - (' + " + ".join([f"CAST({b} AS DOUBLE) * \"{col}_dm\"" for b, col in zip(beta, x_cols)]) + ")"
+        con.execute(f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"')
+        
+        df_resid = n_obs - k - absorbed_df
+        
+        # Compute standard errors
         n_clusters = None
         if vcov == "iid":
             if weights is not None:
@@ -508,13 +231,12 @@ def leanfe_duckdb(
                 if sigma2 is None:
                     raise ValueError('Could not compute sigma²')
                 sigma2 = sigma2[0]
-            se = np.sqrt(sigma2 * np.diag(XtX_inv))
+            se = np.sqrt(np.maximum(sigma2 * np.diag(XtX_inv), 0.0))
+            
         elif vcov == "HC1":
-            k = len(x_cols)
             meat_elements = []
             for i in range(k):
                 for j in range(i, k):
-                    # Calculate the sum of squares/products weighted by squared residuals
                     col_i, col_j = x_cols[i], x_cols[j]
                     expr = f"SUM({col_i}_dm * {col_j}_dm * _resid * _resid)"
                     if weights is not None:
@@ -532,7 +254,8 @@ def leanfe_duckdb(
                     meat[i, j] = meat[j, i] = val
                     idx += 1
             vcov_matrix = XtX_inv @ meat @ XtX_inv
-            se = np.sqrt((n_obs / df_resid) * np.diag(vcov_matrix))
+            se = np.sqrt(np.maximum((n_obs / df_resid) * np.diag(vcov_matrix), 0.0))
+            
         elif vcov == "cluster":
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
@@ -562,27 +285,25 @@ def leanfe_duckdb(
                 adj = ((n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) 
                     if ssc else n_clusters / (n_clusters - 1))
                 vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
-                se = np.sqrt(np.diag(vcov_matrix))
+                se = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
             
             else:
-                # Multi-way clustering using Cameron-Gelbach-Miller (2011)
+                # Multi-way clustering (same as before)
+                from itertools import combinations
                 n_ways = len(cluster_cols)
                 vcov_matrix = np.zeros_like(XtX_inv)
                 n_clusters_list = []
                 
-                # Iterate over all non-empty subsets with alternating signs
                 for subset_size in range(1, n_ways + 1):
                     sign = (-1) ** (subset_size - 1)
                     
                     for cluster_subset in combinations(range(n_ways), subset_size):
-                        # Build intersection cluster ID
                         if subset_size == 1:
                             cluster_id_sql = cluster_cols[cluster_subset[0]]
                         else:
                             cols_to_concat = [cluster_cols[i] for i in cluster_subset]
                             cluster_id_sql = f"CONCAT_WS('_', {', '.join(cols_to_concat)})"
                         
-                        # Compute scores
                         if weights is not None:
                             score_exprs = [f"SUM(\"{col}_dm\" * _resid * {weights}) AS score_{i}" 
                                         for i, col in enumerate(x_cols)]
@@ -598,56 +319,346 @@ def leanfe_duckdb(
                         score_df = con.execute(cluster_query).pl()
                         n_clust = len(score_df)
                         
-                        # Store cluster counts for first-level clusters
                         if subset_size == 1:
                             n_clusters_list.append(n_clust)
                         
-                        # Skip subsets with <= 1 cluster
                         if n_clust <= 1:
                             continue
                         
                         S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
                         meat = S.T @ S
                         
-                        # Accumulate WITHOUT per-component G/(G-1) adjustment
-                        # This matches fixest with G.df = "min" (the default)
                         vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
                 
-                # Apply single G_min/(G_min-1) adjustment at the end
                 if len(n_clusters_list) > 0:
                     G_min = min(n_clusters_list)
                     if G_min > 1:
                         vcov_matrix *= (G_min / (G_min - 1))
                 
-                # Apply K small-sample correction if requested
                 if ssc:
                     vcov_matrix *= ((n_obs - 1) / df_resid)
                 
-                se = np.sqrt(np.diag(vcov_matrix))
+                se = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
                 n_clusters = tuple(n_clusters_list)
-    def safe_cleanup(con, uid_prefix):
-        """Only drops objects created by this specific LeanFE execution."""
-        # Clean up tables/views starting with our unique ID
-        for obj_type in ["TABLE", "VIEW"]:
-            names = con.execute(f"SELECT {obj_type.lower()}_name FROM duckdb_{obj_type.lower()}s WHERE {obj_type.lower()}_name LIKE 'leanfe_%_{uid_prefix}'").fetchall()
-            for (name,) in names:
-                con.execute(f"DROP {obj_type} IF EXISTS \"{name}\" CASCADE")
-        # Specifically drop the fixed names used in loops
-        con.execute("DROP TABLE IF EXISTS fe_means")
+    
+    return beta, se, df_resid, n_clusters
 
-    # Call this at the end
-    safe_cleanup(con, uid)
+def leanfe_duckdb(
+    data: str | pl.DataFrame | pl.LazyFrame | None,
+    y_col: str | None = None,
+    x_cols: list[str] | None = None,
+    fe_cols: list[str] = [],
+    formula: str | None = None,
+    strategy: str = 'auto',
+    weights: str | None = None,
+    demean_tol: float = 1e-8,
+    max_iter: int = 500,
+    vcov: str = "iid",
+    cluster_cols: list[str] | None = None,
+    ssc: bool = False,
+    sample_frac: float | None = None,
+    con: duckdb.DuckDBPyConnection | None = None
+) -> LeanFEResult:
+    """
+    Fixed effects regression using DuckDB with optimized memory usage.
+
+    Supports formulas without fixed effects (e.g., "y ~ x1 + x2").
+    """
+    assert con is not None, "User must provide a duckdb.connect() object."
+
+    est_comp_ratio = None
+
+    # create unique prefix for all temp objects for this call
+    uid = uuid.uuid4().hex[:8]
+    def mk_tmp(name: str) -> str:
+        return f"leanfe_{name}_{uid}"
+
+    tmp_table = mk_tmp("data")
+    created_tmp_tables = [tmp_table]
+
+    # Parse formula if provided
+    if formula is not None:
+        y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
+    elif y_col is None or x_cols is None or fe_cols is None:
+        raise ValueError("Must provide either 'formula' or (y_col, x_cols, fe_cols)")
+    else:
+        factor_vars = []
+        interactions = []
+        instruments = []
+
+    x_cols = list(x_cols)
+    fe_cols = list(fe_cols) if fe_cols is not None else []
+
+    # Build needed columns
+    needed_cols = [y_col] + x_cols + fe_cols + instruments
+    for var, ref in factor_vars:
+        if var not in needed_cols:
+            needed_cols.append(var)
+    for var, factor, ref in interactions:
+        if var not in needed_cols:
+            needed_cols.append(var)
+        if factor not in needed_cols:
+            needed_cols.append(factor)
+    if cluster_cols is not None:
+        needed_cols += [c for c in cluster_cols if c not in needed_cols]
+    if weights is not None and weights not in needed_cols:
+        needed_cols.append(weights)
+
+    col_list = ', '.join([f'"{c}"' for c in needed_cols])
+    where_parts = [f'"{col}" IS NOT NULL' for col in needed_cols]
+    if weights is not None:
+        where_parts.append(f'"{weights}" > 0')
+    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    # If sampling requested, do it in the same CREATE to avoid extra copies
+    if isinstance(data, str):
+        if sample_frac is not None:
+            pct = sample_frac * 100
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause} USING SAMPLE {pct}%"
+            )
+        else:
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause}"
+            )
+        con.execute(sql)
+
+    elif isinstance(data, pl.DataFrame):
+        src_name = mk_tmp("src")
+        con.register(src_name, data.select(needed_cols))
+        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
+        created_tmp_tables.append(src_name)
+
+    elif isinstance(data, pl.LazyFrame):
+        df = data.select(needed_cols).collect()
+        src_name = mk_tmp("src")
+        con.register(src_name, df)
+        con.execute(f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"')
+        created_tmp_tables.append(src_name)
+    else:
+        raise ValueError('Please specify either data or con argument')
+
+    # Handle interactions
+    if interactions:
+        new_cols = _expand_interactions_duckdb(
+            con = con,
+            table_name = tmp_table,
+            interactions = interactions
+        )
+        x_cols = x_cols + new_cols
+
+    # Handle factor variables
+    if factor_vars:
+        new_cols = _expand_factors_duckdb(
+            con = con,
+            table_name = tmp_table,
+            factor_vars = factor_vars
+        )
+        x_cols = x_cols + new_cols
+
+    is_iv = len(instruments) > 0
+
+    if fe_cols:
+        # Compute FE cardinality to decide strategy
+        fe_cardinality = {}
+        for fe in fe_cols:
+            card_query = f"SELECT COUNT(DISTINCT {fe}) FROM {tmp_table}"
+            card = con.execute(card_query).fetchone()
+            if card is None:
+                raise ValueError(f'Error in computing FE ({fe}) cardinality, check dtype of {fe} or try different backend')
+            card = int(card[0])
+            fe_cardinality[fe] = card
+    else:
+        fe_cardinality = {}
+
+    n_obs_initial_query = f"SELECT COUNT(*) FROM {tmp_table}"
+    n_obs_initial = con.execute(n_obs_initial_query).fetchone()
+    if n_obs_initial is None:
+        raise ValueError('Could not fetch number of obs/rows. Check for corrupted data')
+    n_obs_initial = int(n_obs_initial[0])
+
+    if strategy == 'auto':
+
+        est_comp_ratio = estimate_compression_ratio(
+            con = con,
+            table_ref = f'{tmp_table}',
+            x_cols = x_cols,
+            fe_cols = fe_cols
+        )
+
+        if not fe_cols:
+            # No FE: decide between OLS and compress based on compression ratio
+            if est_comp_ratio >= 0.8:
+                inferred_strategy = 'ols'
+            else:
+                inferred_strategy = 'compress'
+
+        else: 
+            inferred_strategy = determine_strategy(
+            vcov, is_iv, fe_cardinality,
+            max_fe_levels=MAX_FE_LEVELS,
+            n_obs=n_obs_initial,
+            n_x_cols=len(x_cols),
+            estimated_compression_ratio=est_comp_ratio)
+
+        print(f'Auto selection: Inferring {inferred_strategy} strategy. N = {n_obs_initial:_}, est. compression ratio: {est_comp_ratio}')
+        strategy = inferred_strategy
+
+    if strategy == 'compress':
+        print('Using compression strategy...')
+        result = leanfe_compress_duckdb(
+            con=con,
+            y_col=y_col,
+            x_cols=x_cols,
+            fe_cols=fe_cols,
+            table_ref=tmp_table,
+            weights=weights,
+            vcov=vcov,
+            cluster_col=cluster_cols,
+            ssc=ssc
+        )
+        result.formula = formula
+        result.fe_cols = fe_cols
+        _safe_cleanup(con, uid)
+        return result
+    
+    if strategy == 'alt_proj':
+        if not fe_cols:
+            raise ValueError("Strategy 'alt_proj' requires FE-cols. Use strategy='ols' instead for OLS without FE.")
+        print('Using FWL/alternating projections strategy...')
+        
+        # Drop singletons
+        if fe_cols:
+            fe_filter = " OR ".join([f'"{fe}" IN (SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1)' for fe in fe_cols])
+            con.execute(f'DELETE FROM "{tmp_table}" WHERE {fe_filter}')
+            n_obs_query = f'SELECT COUNT(*) FROM "{tmp_table}"'
+            n_obs_res = con.execute(n_obs_query).fetchone()
+            if n_obs_res is None:
+                raise ValueError('Error in fetching no of obs/rows')
+            n_obs = int(n_obs_res[0])
+        else:
+            n_obs = n_obs_initial
+
+        # Create working table with _dm columns
+        cols_to_demean = [y_col] + x_cols + instruments
+        cols_to_keep = cols_to_demean + fe_cols
+        if cluster_cols is not None:
+            for c in cluster_cols:
+                if c not in cols_to_keep:
+                    cols_to_keep.append(c)
+        if weights is not None and weights not in cols_to_keep:
+            cols_to_keep.append(weights)
+
+        work_table = mk_tmp("work")
+        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
+        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
+        con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
+        tmp_table = work_table
+
+        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+        dm_cols = [f"{col}_dm" for col in cols_to_demean]
+
+        # Iterative demeaning
+        for it in range(1, max_iter + 1):
+            for fe in fe_cols_ordered:
+                if weights is not None:
+                    agg_expr = ", ".join([f"SUM({c} * {weights}) / SUM({weights}) as {c}_mean" for c in dm_cols])
+                else:
+                    agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
+
+                con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_expr} FROM "{tmp_table}" GROUP BY 1')
+
+                other_cols_str = ", ".join([f'd."{c}"' for c in cols_to_keep])
+                subtract_expr = ", ".join([f'd.{c} - COALESCE(m.{c}_mean, 0) as {c}' for c in dm_cols])
+
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS 
+                    SELECT {other_cols_str}, {subtract_expr}
+                    FROM "{tmp_table}" d
+                    LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
+                """)
+                
+            if it >= 3:
+                avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
+                avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
+                fe_list = ", ".join([f'"{fe}"' for fe in fe_cols])
+                convergence_sql = f"""
+                    SELECT MAX(ABS(val)) 
+                    FROM (
+                        SELECT {avg_exprs} FROM "{tmp_table}" GROUP BY GROUPING SETS ({fe_list})
+                    ) UNPIVOT(val FOR col IN ({avg_names}))
+                """
+                max_err = con.execute(convergence_sql).fetchone()
+                if max_err is None:
+                    raise ValueError('Error in iterative demeaning')
+                max_err = max_err[0]
+                if abs(max_err or 0) < demean_tol:
+                    break
+        
+        # Calculate absorbed df
+        distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
+        n_fe_groups = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
+        if n_fe_groups is not None:
+            n_fe_groups = sum(n_fe_groups)
+        else:
+            n_fe_groups = 0
+        absorbed_df = n_fe_groups - len(fe_cols)
+
+    # Handle OLS case (no FE)
+    elif strategy == 'ols':
+        print('Using simple OLS strategy (no fixed effects)...')
+        it = 0
+        absorbed_df = 0
+        n_obs = n_obs_initial
+        
+        # Create working table with _dm columns (just copy the data)
+        cols_to_demean = [y_col] + x_cols + instruments
+        cols_to_keep = cols_to_demean
+        if cluster_cols is not None:
+            cols_to_keep += cluster_cols
+        if weights is not None and weights not in cols_to_keep:
+            cols_to_keep.append(weights)
+        
+        work_table = mk_tmp("work")
+        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
+        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
+        con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
+        tmp_table = work_table
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    # Run regression (common for both OLS and alt_proj)
+    beta, se, df_resid, n_clusters = _run_regression_duckdb(
+        con=con,
+        tmp_table=tmp_table,
+        y_col=y_col,
+        x_cols=x_cols,
+        instruments=instruments,
+        weights=weights,
+        vcov=vcov,
+        cluster_cols=cluster_cols,
+        ssc=ssc,
+        n_obs=n_obs,
+        absorbed_df=absorbed_df
+    )
+
+    _safe_cleanup(con, uid)
 
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta)), 
-        std_errors=dict(zip(x_cols, se)),     
+        coefficients=dict(zip(x_cols, beta)),
+        std_errors=dict(zip(x_cols, se)),
         n_obs=n_obs,
         iterations=it,
-        vcov_type=vcov,                       
-        is_iv=is_iv,
-        n_instruments=len(instruments) if is_iv else None,
+        vcov_type=vcov,
+        is_iv=len(instruments) > 0,
+        n_instruments=len(instruments) if instruments else None,
         n_clusters=n_clusters,
         df_resid=df_resid,
         formula=formula,
-        fe_cols=fe_cols
+        fe_cols=fe_cols,
+        compression_ratio = est_comp_ratio
     )

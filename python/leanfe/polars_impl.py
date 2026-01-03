@@ -4,7 +4,6 @@ Polars-based fixed effects regression implementation.
 Optimized for speed using Polars LazyFrame/DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
-from scipy.special import it2struve0, it2j0y0
 import polars as pl
 import numpy as np
 import polars.selectors as cs
@@ -27,21 +26,7 @@ MAX_FE_LEVELS = 10_000
 def _expand_factors_polars(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
     """
     Expand factor variables into dummy variables, dropping reference category.
-    
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input DataFrame
-    factor_vars : list of tuples
-        List of (var_name, ref_category) tuples. ref_category is None for first category,
-        or a specific value to use as reference.
-    
-    Returns
-    -------
-    tuple
-        (df, dummy_cols) - DataFrame with dummies added and list of dummy column names
     """
-
     if not factor_vars:
         return lf, []
 
@@ -64,9 +49,9 @@ def _expand_factors_polars(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
                     ref_cat(categories[0])(ref)
                 except (ValueError, TypeError):
                     pass
-            
+
             if ref_cat not in categories:
-                raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {categories}")        
+                raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {categories}")
         # Build expressions for dummy columns
         for cat in categories:
             if cat == ref_cat:
@@ -86,19 +71,6 @@ def _expand_factors_polars(lf: pl.LazyFrame, factor_vars: list[tuple]) -> tuple:
 def _expand_interactions_polars(lf: pl.LazyFrame, interactions: list[tuple]) -> tuple:
     """
     Expand interaction terms: var:i(factor) -> var_cat1, var_cat2, ...
-    
-    Parameters
-    ----------
-    lf : pl.LazyFrame
-        Input LazyFrame
-    interactions : list of tuples
-        List of (var, factor, ref) tuples. ref is None for first category,
-        or a specific value to use as reference.
-    
-    Returns
-    -------
-    tuple
-        (lf, interaction_cols) - LazyFrame with interactions added and list of column names
     """
     if not interactions:
         return lf, []
@@ -114,7 +86,7 @@ def _expand_interactions_polars(lf: pl.LazyFrame, interactions: list[tuple]) -> 
     interaction_exprs = []
 
     for var, factor, ref in interactions:
-        categories = unique_cat_map.select(pl.col(var)).to_list()
+        categories = unique_cat_map.select(pl.col(factor)).to_series().to_list()
         if ref is None:
             # Default: drop first category
             ref_cat = categories[0]
@@ -127,7 +99,7 @@ def _expand_interactions_polars(lf: pl.LazyFrame, interactions: list[tuple]) -> 
                     pass
             if ref_cat not in categories:
                 raise ValueError(f"Reference category '{ref}' not found in {factor}. Available: {categories}")
-        
+
         for cat in categories:
             if cat == ref_cat:
                 continue  # Skip reference category
@@ -144,22 +116,135 @@ def _expand_interactions_polars(lf: pl.LazyFrame, interactions: list[tuple]) -> 
 
 def _cats_to_int(lf: pl.LazyFrame, fe_cols: list[str] | None) -> pl.LazyFrame:
     """If FE cols are coded as pl.Categorical/pl.String, cast to pl.Int for numpy to read."""
-    
     if fe_cols is None:
         return lf
 
-    fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String, pl.Categorical)).collect_schema().names()
+    # select only FE columns that are string/categorical
+    # get schema of selected columns
+    try:
+        fe_cols_cast = lf.select(pl.col(fe_cols)).select(cs.by_dtype(pl.String, pl.Categorical)).collect_schema().names()
+    except Exception:
+        fe_cols_cast = []
     EXPR = [
         pl.col(col).alias(col).cast(pl.Categorical).to_physical()
         for col in fe_cols_cast
     ]
 
-    lf = lf.with_columns(
-        EXPR
-    )
+    if EXPR:
+        lf = lf.with_columns(
+            EXPR
+        )
 
     return lf
 
+def _run_regression(
+    df: pl.DataFrame,
+    y_col: str,
+    x_cols: list[str],
+    instruments: list[str],
+    weights: str | None,
+    vcov: str,
+    cluster_cols: list[str] | None,
+    ssc: bool,
+    n_obs: int,
+    absorbed_df: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int | tuple | None, float | None]:
+    """
+    Common regression logic for both OLS and FE cases.
+    
+    Returns: (beta, se, resid, df_resid, n_clusters, r_squared)
+    """
+    # Extract weights
+    if weights is not None:
+        w = df.select(weights).to_numpy().flatten()
+    else:
+        w = None
+    
+    # Build X including intercept
+    if len(x_cols) > 0:
+        X_reg = df.select([pl.col(c) for c in x_cols]).to_numpy()
+        intercept = np.ones((X_reg.shape[0], 1))
+        X = np.hstack([intercept, X_reg])
+    else:
+        X = np.ones((n_obs, 1))
+    
+    Y = df.select(y_col).to_numpy().flatten()
+    
+    # IV/2SLS or OLS
+    is_iv = len(instruments) > 0
+    if is_iv:
+        Z = df.select(instruments).to_numpy()
+        if X.shape[1] > Z.shape[1]:
+            if not any(np.allclose(col, 1.0) for col in Z.T):
+                Z = np.column_stack([np.ones(Z.shape[0]), Z])
+        beta_full, X_hat_full = iv_2sls(Y, X, Z, w)
+        beta = beta_full[1:] if X.shape[1] > len(x_cols) else beta_full
+        X_hat = X_hat_full
+    else:
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            X_w = X * sqrt_w[:, np.newaxis]
+            Y_w = Y * sqrt_w
+            XtX = X_w.T @ X_w
+            Xty = X_w.T @ Y_w
+        else:
+            XtX = X.T @ X
+            Xty = X.T @ Y
+        beta_full = np.linalg.solve(XtX, Xty)
+        if X.shape[1] == len(x_cols) + 1:
+            beta = beta_full[1:]
+        else:
+            beta = beta_full
+        X_hat = X
+    
+    # Compute (X'X)^-1
+    if w is not None:
+        sqrt_w = np.sqrt(w)
+        X_hat_w = X_hat * sqrt_w[:, np.newaxis]
+        XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+    else:
+        XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+    
+    # Residuals
+    resid = Y - X_hat @ beta_full
+    
+    # Degrees of freedom
+    df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
+    
+    # Cluster IDs
+    cluster_ids = None
+    if vcov == "cluster":
+        if cluster_cols is None:
+            raise ValueError("cluster_cols must be provided when vcov='cluster'")
+        cluster_ids = df.select(cluster_cols).to_numpy()
+        if cluster_ids.ndim == 1:
+            cluster_ids = cluster_ids.reshape(-1, 1)
+    
+    # Standard errors
+    se_full, n_clusters = compute_standard_errors(
+        XtX_inv=XtX_inv,
+        resid=resid,
+        n_obs=n_obs,
+        df_resid=df_resid,
+        vcov=vcov,
+        X=X_hat,
+        weights=w,
+        cluster_ids=cluster_ids,
+        ssc=ssc
+    )
+    
+    # Strip intercept
+    if X.shape[1] == len(x_cols) + 1:
+        se = se_full[1:]
+    else:
+        se = se_full
+    
+    # R-squared
+    rss = np.sum(resid**2)
+    tss = np.sum((Y - np.mean(Y))**2)
+    r_squared = 1 - rss / tss if tss > 0 else None
+    
+    return beta, se, resid, df_resid, n_clusters, r_squared
 
 def leanfe_polars(
     data: str | pl.DataFrame | pl.LazyFrame,
@@ -178,39 +263,12 @@ def leanfe_polars(
 ) -> LeanFEResult:
     """
     Fast fixed effects regression using Polars and FWL theorem.
-    
-    Parameters
-    ----------
-    data : str, pl.LazyFrame or pl.DataFrame
-        Input data: either LazyFrame/DataFrame or path to Parquet file
-    y_col : str, optional
-        Dependent variable column name (optional if formula provided)
-    x_cols : list of str, optional
-        Independent variable column names (optional if formula provided)
-    fe_cols : list of str, optional
-        Fixed effect column names (optional if formula provided)
-    formula : str, optional
-        R-style formula: "y ~ x1 + x2 + x:i(factor) | fe1 + fe2 | z1 + z2" (IV)
-    weights : str, optional
-        Column name for regression weights
-    demean_tol : float, default 1e-5
-        Convergence tolerance for demeaning
-    max_iter : int, default 500
-        Maximum iterations for demeaning
-    vcov : str, default "iid"
-        Variance-covariance estimator: "iid", "HC1", or "cluster"
-    cluster_cols : list of str, optional
-        Clustering variables (required if vcov="cluster")
-    ssc : bool, default False
-        Small sample correction for clustered SEs
-    sample_frac : float, optional
-        Fraction of data to sample (e.g., 0.1 for 10%)
-    
-    Returns
-    -------
-    dict
-        coefficients, std_errors, n_obs, iterations, vcov_type, is_iv, n_instruments, n_clusters
+
+    Supports running OLS with no fixed effects (fe_cols=[] or formula without '|').
     """
+
+    est_comp_ratio = None
+
     # Parse formula if provided
     if formula is not None:
         y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
@@ -220,7 +278,11 @@ def leanfe_polars(
         factor_vars = []
         interactions = []
         instruments = []
-    
+
+    # Ensure lists
+    x_cols = list(x_cols)
+    fe_cols = list(fe_cols) if fe_cols is not None else []
+
     # Build needed columns
     needed_cols = [y_col] + list(x_cols) + list(fe_cols) + instruments
     # Add factor variable columns
@@ -237,7 +299,7 @@ def leanfe_polars(
         needed_cols += [c for c in cluster_cols if c not in needed_cols]
     if weights is not None and weights not in needed_cols:
         needed_cols.append(weights)
-    
+
     # Load data
     if isinstance(data, str):
         lf = pl.scan_parquet(data).select(needed_cols)
@@ -245,68 +307,63 @@ def leanfe_polars(
         lf = data.select(needed_cols)
     else:
         lf = data.select(needed_cols).lazy()
-    
-    # Make x_cols mutable
-    x_cols = list(x_cols)
-    
+
     # Expand interactions
     if interactions:
         lf, interaction_cols = _expand_interactions_polars(lf, interactions)
         x_cols = x_cols + interaction_cols
-    
+
     # Optimize types (always done for memory efficiency)
     factor_var_names = [var for var, ref in factor_vars]
     lf = _cats_to_int(lf, fe_cols + factor_var_names)
-    
+
     # Sample data if requested
     if sample_frac is not None:
         lf = lf.collect().sample(fraction=sample_frac, seed=42).lazy()
-    
+
     # Expand factor variables into dummies
     if factor_vars:
         lf, dummy_cols = _expand_factors_polars(lf, factor_vars)
         x_cols = x_cols + dummy_cols
-    
+
     # Check if we should use compression strategy (faster for IID/HC1 without IV)
-    # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
     is_iv = len(instruments) > 0
     
-    # Strategy selection based on cost estimation:
-    # - YOCO compression: fast when good compression ratio AND low total FE levels
-    # - FWL demeaning: fast when high-cardinality FEs (avoids huge sparse matrix)
-    #
-    # NOTE: A "hybrid" approach (demean high-card FEs, then YOCO on low-card) was tested
-    # but is mathematically incorrect. After partial demeaning, Y still has non-zero means
-    # within low-card FE groups, so adding dummies doesn't give the same result as full FWL.
-    # Compute FE cardinality to decide strategy
-    fe_cardinality = {fe: lf.select(pl.col(fe).n_unique()).collect().item() for fe in fe_cols}
+    fe_cardinality = None
+    if fe_cols:
+        # Strategy selection based on cost estimation:
+        fe_cardinality = {fe: lf.select(pl.col(fe).n_unique()).collect().item() for fe in fe_cols} if fe_cols else {}
 
     if strategy == 'auto':
 
         n_obs_initial = lf.select(pl.len()).collect().item()
 
         est_comp_ratio = estimate_compression_ratio(
-        data = lf,
-        x_cols = x_cols,
-        fe_cols = fe_cols
+            data = lf,
+            x_cols = x_cols,
+            fe_cols = fe_cols
         )
-        
-        inferred_strategy = determine_strategy(
-            vcov, is_iv, fe_cardinality,
-            max_fe_levels=MAX_FE_LEVELS,
-            n_obs=n_obs_initial,
-            n_x_cols=len(x_cols),
-            estimated_compression_ratio=est_comp_ratio
-        )
-        print(f'Auto strategy: Inferring {inferred_strategy} strategy')
+
+        if not fe_cols:
+            # No FE: decide between OLS and compress based on compression ratio
+            if est_comp_ratio >= 0.8:
+                inferred_strategy = 'ols'
+            else:
+                inferred_strategy = 'compress'
+        else:
+            inferred_strategy = determine_strategy(
+                vcov, is_iv, fe_cardinality,
+                max_fe_levels=MAX_FE_LEVELS,
+                n_obs=n_obs_initial,
+                n_x_cols=len(x_cols),
+                estimated_compression_ratio=est_comp_ratio
+            )
+
+        print(f'Auto selection: Inferring {inferred_strategy} strategy. N = {n_obs_initial:_}, est. compression ratio: {est_comp_ratio}')
         strategy = inferred_strategy
 
-        
     if strategy == 'compress':
         print('Using compresssion strategy...')
-        # Use YOCO compression strategy - much faster for discrete regressors
-        # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
-
         result = leanfe_compress_polars(
             lf=lf,
             y_col=y_col,
@@ -320,10 +377,13 @@ def leanfe_polars(
         # Update attributes directly
         result.formula = formula
         result.fe_cols = fe_cols
-        
+
         return result
 
     if strategy == 'alt_proj':
+        if not fe_cols:
+            raise ValueError("Strategy 'alt_proj' requires FE-cols. Use strategy='ols' instead for OLS without FE.")
+        assert fe_cardinality is not None, f"No FE-cardinality compute for strategy = {strategy}"
         print('Using FWL/alternating projections strategy...')
 
         # Drop singletons (keep as LazyFrame)
@@ -352,127 +412,71 @@ def leanfe_polars(
                         (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
                         for c in cols_to_demean
                     ]
-                
+
                 # Directly overwrite columns in place
                 lf = lf.with_columns_seq(
                     demean_exprs
                 )
-            
+
             # Check convergence - only collect for this check if necessary
             if it >= 3:
                 check_exprs = [
                     pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
                     for fe in fe_cols
-                ]                
+                ]
                 max_mean = lf.select(pl.max_horizontal(check_exprs)).max().collect().item()
                 if max_mean < demean_tol:
+                    iterations = it
                     break
-    df = lf.collect()
-    # Extract weights AFTER collection
-    if weights is not None:
-        w = df.select(weights).to_numpy().flatten()
-    else:
-        w = None
+            iterations = it
 
-    # Get n_obs from the collected DataFrame
-    n_obs = len(df)
+        df = lf.collect()
+        unique_counts = df.select([
+            pl.col(fe).n_unique() for fe in fe_cols
+        ])
+        # Sum the results and calculate the absorbed degrees of freedom
+        # .row(0) gets the first row as a tuple, sum() adds them up
+        absorbed_df = sum(unique_counts.row(0)) - len(fe_cols)
+        n_obs = len(df)
 
-    # Build X including intercept if present in df
-    X = df.select(pl.ones(pl.len()), pl.col(x_cols)).to_numpy()    
-    Y = df.select(y_col).to_numpy().flatten()
-    
-    # IV/2SLS or OLS
-    is_iv = len(instruments) > 0
-    if is_iv:
-        Z = df.select(instruments).to_numpy()
-        # If X includes intercept but Z doesn't, ensure Z has an intercept column
-        if X.shape[1] > Z.shape[1]:
-            # check whether Z already contains a constant column
-            if not any(np.allclose(col, 1.0) for col in Z.T):
-                Z = np.column_stack([np.ones(Z.shape[0]), Z])
-        beta_full, X_hat_full = iv_2sls(Y, X, Z, w)
-        beta = beta_full[1:] if X.shape[1] > len(x_cols) else beta_full
-        X_hat = X_hat_full
+        # Calculate final residual degrees of freedom
+        df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
+        
+    # Handle OLS case (no FE)
+    elif strategy == 'ols':
+        print('Using simple OLS strategy (no fixed effects)...')
+        iterations = 0
+        absorbed_df = 0
+        df = lf.collect()    
+        n_obs = len(df)
     else:
-        if w is not None:
-            sqrt_w = np.sqrt(w)
-            X_w = X * sqrt_w[:, np.newaxis]
-            Y_w = Y * sqrt_w
-            XtX = X_w.T @ X_w
-            Xty = X_w.T @ Y_w
-        else:
-            XtX = X.T @ X
-            Xty = X.T @ Y
-        beta_full = np.linalg.solve(XtX, Xty)
-        # If we added intercept, strip intercept from returned coefficients
-        if X.shape[1] == len(x_cols) + 1:
-            beta = beta_full[1:]
-        else:
-            beta = beta_full
-        X_hat = X
-    
-    # Compute (X'X)^-1 for standard errors
-    if w is not None:
-        sqrt_w = np.sqrt(w)
-        X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-        XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
-    else:
-        XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
-    
-    # Residuals
-    resid = Y - X_hat @ (beta_full if 'beta_full' in locals() else np.concatenate([[0], beta]))
-    
-    # Calculate absorbed degrees of freedom
-    fe_counts = {fe: df.group_by(fe).agg(pl.len()).height for fe in fe_cols}
-    absorbed_df = sum(fe_counts.values()) - len(fe_cols)
-    df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
-    
-    cluster_ids = None
-    if vcov == "cluster":
-        cluster_ids = df.select(cluster_cols).to_numpy()
-        if cluster_cols is None:
-            raise ValueError("cluster_cols must be provided when vcov='cluster'")
-        if cluster_ids.ndim == 1:
-            cluster_ids = cluster_ids.reshape(-1, 1)
-        else:
-            # Multi-way clustering: pass as 2D array
-            cluster_ids = df.select(cluster_cols).to_numpy()
-    # Then call the new compute_multiway_standard_errors function    
-    # Compute standard errors
-    se_full, n_clusters = compute_standard_errors(
-        XtX_inv=XtX_inv,
-        resid=resid,
-        n_obs=n_obs,
-        df_resid=df_resid,
-        vcov=vcov,
-        X=X_hat,
-        weights=w,
-        cluster_ids=cluster_ids,
-        ssc=ssc
-    )
-    
-    # If an intercept exists, strip intercept from reported SEs
-    if X.shape[1] == len(x_cols) + 1:
-        se = se_full[1:]
-    else:
-        se = se_full
-    
-    # Compute R-squared (within)
-    rss = np.sum(resid**2)
-    tss = np.sum((Y - np.mean(Y))**2)
-    r_squared_within = 1 - rss / tss if tss > 0 else None
-    
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
+    beta, se, resid, df_resid, n_clusters, r_squared = _run_regression(
+    df=df,
+    y_col=y_col,
+    x_cols=x_cols,
+    instruments=instruments,
+    weights=weights,
+    vcov=vcov,
+    cluster_cols=cluster_cols,
+    ssc=ssc,
+    n_obs=n_obs,
+    absorbed_df=absorbed_df)
+
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta)), 
-        std_errors=dict(zip(x_cols, se)),     
+        coefficients=dict(zip(x_cols, beta)),
+        std_errors=dict(zip(x_cols, se)),
         n_obs=n_obs,
-        iterations=it,
-        vcov_type=vcov,                       
-        is_iv=is_iv,
-        n_instruments=len(instruments) if is_iv else None,
+        iterations=iterations,
+        vcov_type=vcov,
+        is_iv=len(instruments) > 0,
+        n_instruments=len(instruments) if instruments else None,
         n_clusters=n_clusters,
         df_resid=df_resid,
         formula=formula,
         fe_cols=fe_cols,
-        r_squared = r_squared_within
+        r_squared=r_squared,
+        compression_ratio = est_comp_ratio
     )
