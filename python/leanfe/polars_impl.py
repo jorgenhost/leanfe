@@ -172,7 +172,7 @@ def leanfe_polars(
     max_iter: int = 500,
     vcov: str = "iid",
     cluster_cols: list[str] | None = None,
-    ssc: bool = False,
+    ssc: bool = True,
     sample_frac: float | None = None
 ) -> LeanFEResult:
     """
@@ -306,7 +306,6 @@ def leanfe_polars(
         # Use YOCO compression strategy - much faster for discrete regressors
         # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
 
-        cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
         result = leanfe_compress_polars(
             lf=lf,
             y_col=y_col,
@@ -314,7 +313,7 @@ def leanfe_polars(
             fe_cols=fe_cols,
             weights=weights,
             vcov=vcov,
-            cluster_col=cluster_col,
+            cluster_col=cluster_cols,
             ssc=ssc
         )
         # Update attributes directly
@@ -349,6 +348,9 @@ def leanfe_polars(
         # Processing them first quickly reduces variation in the data.
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
         
+        # Use a slightly tighter tolerance internally for alt_proj to reduce tiny residual differences
+        local_tol = min(demean_tol, 1e-12)
+        
         # FWL demeaning
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
@@ -373,18 +375,37 @@ def leanfe_polars(
                     df.select(pl.col(y_col).mean().over(fe).abs().max()).item()
                     for fe in fe_cols
                 )
-                if max_mean < demean_tol:
+                if max_mean < local_tol:
                     break
     
+        # Add explicit intercept column so X ordering matches compress path
+        df = df.with_columns(pl.lit(1.0).alias('(Intercept)'))
+
     # Extract X and Y for OLS/IV solve
-    X = df.select(x_cols).to_numpy()
+    # If we entered alt_proj above, df is defined. Otherwise fall back to lf.collect() -> df
+    if 'df' not in locals():
+        df = lf.collect()
+    
+    # Build X including intercept if present in df
+    if '(Intercept)' in df.columns:
+        X = df.select(['(Intercept)'] + x_cols).to_numpy()
+    else:
+        # No explicit intercept: follow old behavior but keep degrees-of-freedom calculation
+        X = df.select(x_cols).to_numpy()
     Y = df.select(y_col).to_numpy().flatten()
     
     # IV/2SLS or OLS
     is_iv = len(instruments) > 0
     if is_iv:
         Z = df.select(instruments).to_numpy()
-        beta, X_hat = iv_2sls(Y, X, Z, w)
+        # If X includes intercept but Z doesn't, ensure Z has an intercept column
+        if X.shape[1] > Z.shape[1]:
+            # check whether Z already contains a constant column
+            if not any(np.allclose(col, 1.0) for col in Z.T):
+                Z = np.column_stack([np.ones(Z.shape[0]), Z])
+        beta_full, X_hat_full = iv_2sls(Y, X, Z, w)
+        beta = beta_full[1:] if X.shape[1] > len(x_cols) else beta_full
+        X_hat = X_hat_full
     else:
         if w is not None:
             sqrt_w = np.sqrt(w)
@@ -395,7 +416,12 @@ def leanfe_polars(
         else:
             XtX = X.T @ X
             Xty = X.T @ Y
-        beta = np.linalg.solve(XtX, Xty)
+        beta_full = np.linalg.solve(XtX, Xty)
+        # If we added intercept, strip intercept from returned coefficients
+        if X.shape[1] == len(x_cols) + 1:
+            beta = beta_full[1:]
+        else:
+            beta = beta_full
         X_hat = X
     
     # Compute (X'X)^-1 for standard errors
@@ -407,25 +433,26 @@ def leanfe_polars(
         XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
     
     # Residuals
-    resid = Y - X_hat @ beta
+    resid = Y - X_hat @ (beta_full if 'beta_full' in locals() else np.concatenate([[0], beta]))
     
     # Calculate absorbed degrees of freedom
     fe_counts = {fe: df.group_by(fe).agg(pl.len()).height for fe in fe_cols}
     absorbed_df = sum(fe_counts.values()) - len(fe_cols)
-    df_resid = n_obs - len(x_cols) - absorbed_df
+    df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
+    
     cluster_ids = None
     if vcov == "cluster":
+        cluster_ids = df.select(cluster_cols).to_numpy()
         if cluster_cols is None:
             raise ValueError("cluster_cols must be provided when vcov='cluster'")
-        if len(cluster_cols) == 1:
-            cluster_ids = df.select(cluster_cols[0]).to_numpy().flatten()
+        if cluster_ids.ndim == 1:
+            cluster_ids = cluster_ids.reshape(-1, 1)
         else:
             # Multi-way clustering: pass as 2D array
             cluster_ids = df.select(cluster_cols).to_numpy()
-
     # Then call the new compute_multiway_standard_errors function    
     # Compute standard errors
-    se, n_clusters = compute_standard_errors(
+    se_full, n_clusters = compute_standard_errors(
         XtX_inv=XtX_inv,
         resid=resid,
         n_obs=n_obs,
@@ -436,6 +463,12 @@ def leanfe_polars(
         cluster_ids=cluster_ids,
         ssc=ssc
     )
+    
+    # If an intercept exists, strip intercept from reported SEs
+    if X.shape[1] == len(x_cols) + 1:
+        se = se_full[1:]
+    else:
+        se = se_full
     
     # Compute R-squared (within)
     rss = np.sum(resid**2)

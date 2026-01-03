@@ -8,6 +8,7 @@ import duckdb
 import numpy as np
 import polars as pl
 import uuid
+from itertools import combinations
 
 from leanfe.result import LeanFEResult
 from leanfe.common import (
@@ -302,7 +303,6 @@ def leanfe_duckdb(
         print('Using compresssion strategy...')
         # Use YOCO compression strategy - much faster and lower memory
         # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
-        cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
 
         result = leanfe_compress_duckdb(
             con=con,
@@ -312,7 +312,7 @@ def leanfe_duckdb(
             table_ref = tmp_table,
             weights=weights,
             vcov=vcov,
-            cluster_col=cluster_col,
+            cluster_col=cluster_cols,
             ssc=ssc
         )
         
@@ -453,6 +453,8 @@ def leanfe_duckdb(
         
         resid_expr = f'"{y_col}_dm" - (' + " + ".join([f"{b} * \"{col}_dm\"" for b, col in zip(beta, x_cols)]) + ")"
         con.execute(f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"')    
+    
+
     # Degrees of freedom
     distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
     n_fe_groups = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
@@ -463,7 +465,10 @@ def leanfe_duckdb(
         
     absorbed_df = n_fe_groups - len(fe_cols)
     df_resid = n_obs - k - absorbed_df
-
+    sigma2_test = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()[0]
+    print(f"sigma2: {sigma2_test}")
+    print(f"1/sigma2: {1/sigma2_test}")
+    
     # Compute XtX_inv
     if is_iv:
         if w is not None:
@@ -561,11 +566,9 @@ def leanfe_duckdb(
                     if ssc else n_clusters / (n_clusters - 1))
                 vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
                 se = np.sqrt(np.diag(vcov_matrix))
-                
+            
             else:
                 # Multi-way clustering using Cameron-Gelbach-Miller (2011)
-                from itertools import combinations
-                
                 n_ways = len(cluster_cols)
                 vcov_matrix = np.zeros_like(XtX_inv)
                 n_clusters_list = []
@@ -579,16 +582,15 @@ def leanfe_duckdb(
                         if subset_size == 1:
                             cluster_id_sql = cluster_cols[cluster_subset[0]]
                         else:
-                            # Concatenate for intersection
                             cols_to_concat = [cluster_cols[i] for i in cluster_subset]
                             cluster_id_sql = f"CONCAT_WS('_', {', '.join(cols_to_concat)})"
                         
-                        # Compute scores for this clustering dimension
+                        # Compute scores
                         if weights is not None:
-                            score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" 
+                            score_exprs = [f"SUM(\"{col}_dm\" * _resid * {weights}) AS score_{i}" 
                                         for i, col in enumerate(x_cols)]
                         else:
-                            score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" 
+                            score_exprs = [f"SUM(\"{col}_dm\" * _resid) AS score_{i}" 
                                         for i, col in enumerate(x_cols)]
                         
                         cluster_query = f"""
@@ -599,33 +601,33 @@ def leanfe_duckdb(
                         score_df = con.execute(cluster_query).pl()
                         n_clust = len(score_df)
                         
-                        # Skip subsets with <= 1 cluster
-                        if n_clust <= 1:
-                            # If this is a first-order subset, still record for n_clusters_list
-                            if subset_size == 1:
-                                n_clusters_list.append(n_clust)
-                            continue
-                        
                         # Store cluster counts for first-level clusters
                         if subset_size == 1:
                             n_clusters_list.append(n_clust)
                         
+                        # Skip subsets with <= 1 cluster
+                        if n_clust <= 1:
+                            continue
+                        
                         S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
                         meat = S.T @ S
                         
-                        # Cluster-count adjustment (only G/(G-1) per component)
-                        adj_g = n_clust / (n_clust - 1)
-                        
-                        # Add/subtract with alternating signs; do NOT multiply (n_obs-1)/df_resid here
-                        vcov_matrix += sign * adj_g * (XtX_inv @ meat @ XtX_inv)
+                        # Accumulate WITHOUT per-component G/(G-1) adjustment
+                        # This matches fixest with G.df = "min" (the default)
+                        vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
                 
-                # Apply small-sample df correction once if requested
+                # Apply single G_min/(G_min-1) adjustment at the end
+                if len(n_clusters_list) > 0:
+                    G_min = min(n_clusters_list)
+                    if G_min > 1:
+                        vcov_matrix *= (G_min / (G_min - 1))
+                
+                # Apply K small-sample correction if requested
                 if ssc:
                     vcov_matrix *= ((n_obs - 1) / df_resid)
                 
                 se = np.sqrt(np.diag(vcov_matrix))
-                n_clusters = tuple(n_clusters_list)  # Return as tuple for multi-way
-                            
+                n_clusters = tuple(n_clusters_list)
     def safe_cleanup(con, uid_prefix):
         """Only drops objects created by this specific LeanFE execution."""
         # Clean up tables/views starting with our unique ID

@@ -17,7 +17,7 @@ import polars as pl
 from scipy import sparse
 from duckdb import DuckDBPyConnection
 from typing import Any, Callable, TypeAlias
-ArrayLike: TypeAlias = np.ndarray | sparse.sparray | sparse.csr_matrix
+ArrayLike: TypeAlias = np.ndarray | sparse.spmatrix
 
 def determine_strategy(
     vcov: str,
@@ -114,38 +114,24 @@ def compress_polars(
     x_cols: list[str],
     fe_cols: list[str],
     weights: str | None = None,
-    cluster_col: str | None = None
+    cluster_col: str | list[str] | None = None  # ← Changed to accept list
 ) -> tuple[pl.DataFrame, int]:
     """
     Compress data using GROUP BY on regressors + fixed effects.
     
-    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col(s)
     in the grouping to ensure each compressed record belongs to one cluster.
-    
-    Parameters
-    ----------
-    lf : pl.LazyFrame
-        Input data
-    y_col : str
-        Dependent variable column
-    x_cols : list of str
-        Regressor columns
-    fe_cols : list of str
-        Fixed effect columns
-    weights : str, optional
-        Weight column name
-    cluster_col : str, optionalestimate_compression_ratio
-        Cluster column for within-cluster compression
-        
-    Returns
-    -------
-    tuple
-        (compressed_df, n_obs_original)
     """
     group_cols = x_cols + fe_cols
-    # For cluster SEs, add cluster to grouping (Section 5.3.1)
-    if cluster_col is not None and cluster_col not in group_cols:
-        group_cols = group_cols + [cluster_col]
+    
+    # For cluster SEs, add cluster columns to grouping
+    if cluster_col is not None:
+        # Normalize to list
+        cluster_cols_list = [cluster_col] if isinstance(cluster_col, str) else cluster_col
+        # Add all cluster columns that aren't already in group_cols
+        for col in cluster_cols_list:
+            if col not in group_cols:
+                group_cols.append(col)
     
     n_obs_original = lf.select(pl.len()).collect().item()
     
@@ -172,7 +158,6 @@ def compress_polars(
     ])
     
     return compressed, n_obs_original
-
 
 class DuckDBResult:
     """Wrapper for DuckDB numpy result to provide dict-like access."""
@@ -264,38 +249,24 @@ def compress_duckdb(
     fe_cols: list[str],
     table_ref: str,
     weights: str | None = None,
-    cluster_col: str | None = None
+    cluster_col: str | list[str] | None = None  # ← Changed to accept list
 ) -> tuple[DuckDBResult, int]:
     """
     Compress data using SQL GROUP BY.
     
-    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col
+    For cluster SEs (Section 5.3.1 of YOCO paper), include cluster_col(s)
     in the grouping to ensure each compressed record belongs to one cluster.
-    
-    Parameters
-    ----------
-    con : duckdb.Connection
-        DuckDB connection with 'data' table
-    y_col : str
-        Dependent variable column
-    x_cols : list of str
-        Regressor columns
-    fe_cols : list of str
-        Fixed effect columns
-    weights : str, optional
-        Weight column name
-    cluster_col : str, optional
-        Cluster column for within-cluster compression
-        
-    Returns
-    -------
-    tuple
-        (compressed_data as DuckDBResult, n_obs_original)
     """
     group_cols = x_cols + fe_cols
-    # For cluster SEs, add cluster to grouping (Section 5.3.1)
-    if cluster_col is not None and cluster_col not in group_cols:
-        group_cols = group_cols + [cluster_col]
+    
+    # For cluster SEs, add cluster columns to grouping
+    if cluster_col is not None:
+        # Normalize to list
+        cluster_cols_list = [cluster_col] if isinstance(cluster_col, str) else cluster_col
+        # Add all cluster columns that aren't already in group_cols
+        for col in cluster_cols_list:
+            if col not in group_cols:
+                group_cols.append(col)
     
     group_cols_sql = ", ".join(group_cols)
     res = con.execute(f"SELECT COUNT(*) FROM {table_ref}").fetchone()
@@ -332,7 +303,6 @@ def compress_duckdb(
     result = con.execute(query).fetchnumpy()
     compressed = DuckDBResult(result)
     return compressed, n_obs_original
-
 
 def _extract_numpy_arrays(
     compressed_df: pl.DataFrame | DuckDBResult, 
@@ -620,45 +590,10 @@ def compute_se_compress(
     e0_g: np.ndarray | None = None,
     ssc: bool = False
 ) -> tuple[np.ndarray, int | tuple[int, ...] | None]:
-
     """
     Compute standard errors from compressed data.
     
-    For cluster SEs, implements Section 5.3.1 of YOCO paper using sparse matrices:
-    Ξ̂ = M̃ᵀ diag(ẽ⁰) W̃_C W̃_Cᵀ diag(ẽ⁰) M̃
-    
-    The sparse cluster matrix W̃_C efficiently aggregates scores within clusters,
-    avoiding explicit loops and enabling vectorized computation.
-    
-    Parameters
-    ----------
-    XtX_inv : np.ndarray
-        Inverse of X'X
-    rss_total : float
-        Total residual sum of squares
-    rss_g : np.ndarray
-        Per-group RSS
-    n_obs : int
-        Original number of observations
-    df_resid : int
-        Residual degrees of freedom
-    vcov : str
-        "iid", "HC1", or "cluster"
-    X : np.ndarray or scipy.sparse matrix
-        Design matrix (compressed)
-    x_cols : list of str
-        Names of regressor columns (to extract subset of SEs)
-    cluster_ids : np.ndarray, optional
-        Cluster ID for each compressed group (required for cluster SEs)
-    e0_g : np.ndarray, optional
-        Sum of residuals per group: ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ (required for cluster SEs)
-    ssc : bool
-        Small sample correction for cluster SEs
-        
-    Returns
-    -------
-    tuple
-        (se for x_cols only, n_clusters or None)
+    For cluster SEs, implements Section 5.3.1 of YOCO paper using sparse matrices.
     """
     k_x = len(x_cols)
     n_clusters = None
@@ -675,123 +610,117 @@ def compute_se_compress(
         else:
             meat = X.T @ (X * rss_g[:, np.newaxis])
         vcov_matrix = XtX_inv @ meat @ XtX_inv
-        # HC1 adjustment
         adjustment = n_obs / df_resid
-        # Use np.maximum to handle numerical precision issues (tiny negative values)
         se_full = np.sqrt(np.maximum(np.diag(vcov_matrix) * adjustment, 0.0))
         
     elif vcov.lower() == "cluster":
         if cluster_ids is None or e0_g is None:
             raise ValueError("cluster_ids and e0_g required for cluster SEs")
-
-        # Build sparse cluster indicator matrix W̃_C
-        W_C, n_clusters_first = _build_sparse_cluster_matrix(cluster_ids)
-        # In compressed case cluster_ids is length G array of cluster ids per group.
-
-        # Compute scores per group: diag(ẽ⁰) @ M̃ = X * e0_g[:, None]
-        if sparse.issparse(X):
-            # X is sparse: multiply each row by corresponding e0_g
-            scores_g = X.multiply(e0_g[:, np.newaxis])  # G x p sparse
-        else:
-            scores_g = sparse.csr_matrix(X * e0_g[:, np.newaxis])  # G x p sparse
-
-        # We'll build the alternating-sum across all non-empty subsets of clustering dimensions.
-        # For the compressed case we might have only one cluster dimension (cluster_ids is 1D),
-        # but we keep the consistent logic for potential multi-way compressed inputs.
-
-        # If cluster_ids is 1D, we can reuse W_C directly (single-way)
-        if isinstance(cluster_ids, (list, tuple)) or (hasattr(cluster_ids, "ndim") and getattr(cluster_ids, "ndim") == 2):
-            # Multi-way: cluster_ids should be provided as array-like with shape (G, nways)
-            # We'll compute meat components via W_C per subset (constructed above for single-dim)
-            # For compressed multi-way, the caller should pass cluster_ids structured appropriately.
-            # For simplicity we follow the same pattern as in the uncompressed implementation:
-            # sum sign * (XtX_inv @ meat @ XtX_inv) and apply single G_min correction at the end.
-            from itertools import combinations as _combinations
-
-            # Determine number of ways
-            if np.ndim(cluster_ids) == 1:
-                n_ways = 1
+        
+        # Single-way clustering
+        if cluster_ids.ndim == 1:
+            W_C, n_clusters = _build_sparse_cluster_matrix(cluster_ids)
+            
+            if sparse.issparse(X):
+                scores_g = X.multiply(e0_g[:, np.newaxis])
             else:
-                n_ways = cluster_ids.shape[1]
-
-            vcov_matrix = np.zeros_like(XtX_inv)
-            n_clusters_list = []
-
-            for subset_size in range(1, n_ways + 1):
-                sign = (-1) ** (subset_size - 1)
-
-                for cluster_subset in _combinations(range(n_ways), subset_size):
-                    # Build intersection cluster ID
-                    if subset_size == 1:
-                        # cluster_ids can be 2D; take the column
-                        col = cluster_ids[:, cluster_subset[0]]
-                        unique_vals, inverse = np.unique(col, return_inverse=True)
-                        n_clust = len(unique_vals)
-                    else:
-                        # create string concat IDs to compute unique clusters
-                        concat = np.array([
-                            '_'.join(str(cluster_ids[i, j]) for j in cluster_subset)
-                            for i in range(len(cluster_ids))
-                        ])
-                        unique_vals, inverse = np.unique(concat, return_inverse=True)
-                        n_clust = len(unique_vals)
-
-                    if n_clust <= 1:
-                        continue
-
-                    # Keep track of first-order cluster sizes
-                    if subset_size == 1:
-                        n_clusters_list.append(n_clust)
-
-                    # Build sparse W_C for this subset
-                    W_C_sub = sparse.csr_matrix(
-                        (np.ones(len(inverse)), (np.arange(len(inverse)), inverse)),
-                        shape=(len(inverse), n_clust)
-                    )
-
-                    # cluster_scores = W_C_sub.T @ scores_g  (C x p)
-                    cluster_scores = W_C_sub.T @ scores_g
-
-                    if sparse.issparse(cluster_scores):
-                        meat = (cluster_scores.T @ cluster_scores).toarray()
-                    else:
-                        meat = cluster_scores.T @ cluster_scores
-
-                    vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
-
-            # Apply G_min correction once (fixest default) if ssc requested
-            if ssc and len(n_clusters_list) > 0:
-                G_min = min(n_clusters_list)
-                if G_min > 1:
-                    vcov_matrix *= (G_min / (G_min - 1))
-
-            # Apply small-sample K adjustment if requested
-            if ssc:
-                vcov_matrix *= ((n_obs - 1) / df_resid)
-
-            se_full = np.sqrt(np.diag(vcov_matrix))
-            n_clusters = tuple(n_clusters_list) if len(n_clusters_list) > 1 else (n_clusters_list[0],)
-            return se_full[:k_x], n_clusters
-
-        else:
-            # Single-way clustering (existing path)
-            W_C_single, n_clusters = _build_sparse_cluster_matrix(cluster_ids)
-            # cluster_scores = W_C_single.T @ scores_g
-            cluster_scores = W_C_single.T @ scores_g
+                scores_g = sparse.csr_matrix(X * e0_g[:, np.newaxis])
+            
+            cluster_scores = W_C.T @ scores_g
+            
             if sparse.issparse(cluster_scores):
                 meat = (cluster_scores.T @ cluster_scores).toarray()
             else:
                 meat = cluster_scores.T @ cluster_scores
-
+            
             if ssc:
-                adjustment = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
+                adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid)
             else:
-                adjustment = n_clusters / (n_clusters - 1)
-
-            vcov_matrix = adjustment * (XtX_inv @ meat @ XtX_inv)
-            se_full = np.sqrt(np.diag(vcov_matrix))
+                adj = n_clusters / (n_clusters - 1)
+            
+            vcov_matrix = adj * (XtX_inv @ meat @ XtX_inv)
+            se_full = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
             return se_full[:k_x], n_clusters
-
+        
+        # Multi-way clustering - FIXED to match fixest G.df="min" default
+        if cluster_ids.ndim == 2 and cluster_ids.shape[1] > 1:
+            from itertools import combinations as _combinations
+            
+            G = cluster_ids.shape[0]
+            n_ways = cluster_ids.shape[1]
+            vcov_matrix = np.zeros_like(XtX_inv)
+            first_order_counts = []
+            
+            # Precompute scores per group
+            if sparse.issparse(X):
+                scores_g = X.multiply(e0_g[:, np.newaxis])
+            else:
+                scores_g = sparse.csr_matrix(X * e0_g[:, np.newaxis])
+            
+            # Accumulate components WITHOUT per-component G/(G-1) adjustment
+            for subset_size in range(1, n_ways + 1):
+                sign = (-1) ** (subset_size - 1)
+                
+                for cluster_subset in _combinations(range(n_ways), subset_size):
+                    # Build intersection cluster ID
+                    if subset_size == 1:
+                        col = cluster_ids[:, cluster_subset[0]]
+                        unique_vals, inverse = np.unique(col, return_inverse=True)
+                        n_clust = len(unique_vals)
+                    else:
+                        concat = np.array([
+                            '_'.join(str(cluster_ids[i, j]) for j in cluster_subset)
+                            for i in range(G)
+                        ])
+                        unique_vals, inverse = np.unique(concat, return_inverse=True)
+                        n_clust = len(unique_vals)
+                    
+                    if n_clust <= 1:
+                        if subset_size == 1:
+                            first_order_counts.append(n_clust)
+                        continue
+                    
+                    if subset_size == 1:
+                        first_order_counts.append(n_clust)
+                    
+                    # Build W_C for this subset
+                    W_C_sub = sparse.csr_matrix(
+                        (np.ones(len(inverse)), (np.arange(len(inverse)), inverse)),
+                        shape=(len(inverse), n_clust)
+                    )
+                    
+                    cluster_scores = W_C_sub.T @ scores_g
+                    
+                    if sparse.issparse(cluster_scores):
+                        meat = (cluster_scores.T @ cluster_scores).toarray()
+                    else:
+                        meat = cluster_scores.T @ cluster_scores
+                    
+                    # KEY FIX: Do NOT apply G/(G-1) per component
+                    # Accumulate unadjusted components
+                    vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
+            
+            # Apply single G_min/(G_min-1) adjustment at the end (fixest default with G.df="min")
+            if len(first_order_counts) > 0:
+                G_min = min(first_order_counts)
+                if G_min > 1:
+                    vcov_matrix *= (G_min / (G_min - 1))
+            
+            # Apply K small-sample correction if requested
+            if ssc:
+                vcov_matrix *= ((n_obs - 1) / df_resid)
+            
+            se_full = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
+            n_clusters = tuple(first_order_counts) if len(first_order_counts) > 0 else None
+            return se_full[:k_x], n_clusters
+        
+        raise ValueError("cluster_ids must be 1D for single-way or 2D for multi-way clustering")
+    
+    else:
+        raise ValueError(f"vcov must be 'iid', 'HC1', or 'cluster', got '{vcov}'")
+    
+    return se_full[:k_x], n_clusters
+    
 def leanfe_compress_polars(
     lf: pl.LazyFrame,
     y_col: str,
@@ -799,47 +728,21 @@ def leanfe_compress_polars(
     fe_cols: list[str],
     weights: str | None = None,
     vcov: str = "iid",
-    cluster_col: str | None = None,
+    cluster_col: str | list[str] | None = None,  # ← Changed to accept list
     ssc: bool = False
 ) -> LeanFEResult:
     """
     Execute high-dimensional fixed effects regression via data compression.
     Backend: Polars.
-
-    Compresses data into unique groups of (regressors + fixed effects) to solve 
-    WLS efficiently. Returns estimates.
-
-    Parameters
-    ----------
-    lf : pl.LazyFrame
-        Input dataset.
-    y_col : str
-        Dependent variable name.
-    x_cols : list[str]
-        Independent variable names.
-    fe_cols : list[str]
-        Fixed effect column names.
-    weights : str, optional
-        Weight column name.
-    vcov : {"iid", "cluster"}, default "iid"
-        Variance-covariance type.
-    cluster_col : str, optional
-        Column for clustered SEs; required if vcov="cluster".
-    ssc : bool, default False
-        Apply small-sample correction.
-
-    Returns
-    -------
-    dict
-        Results containing:
-        - coefficients, std_errors: Mappings for x_cols.
-        - n_obs, n_compressed, compression_ratio: Data scale metrics.
-        - df_resid, rss, n_clusters: Model fit statistics.
     """
-    # Compress data
+    # Normalize cluster_col to list
+    if cluster_col is not None and not isinstance(cluster_col, list):
+        cluster_col = [cluster_col]
+    
+    # Compress data - pass all cluster columns for grouping if multi-way
     compressed, n_obs = compress_polars(
         lf, y_col, x_cols, fe_cols, weights, 
-        cluster_col=cluster_col if vcov.lower() == "cluster" else None
+        cluster_col=cluster_col
     )
     n_compressed = len(compressed)
     
@@ -862,31 +765,35 @@ def leanfe_compress_polars(
     cluster_ids = None
     e0_g = None
     if vcov.lower() == "cluster" and cluster_col is not None:
-        cluster_ids = compressed[cluster_col].to_numpy()
+        # ← KEY FIX: Get ALL cluster columns, not just the first one
+        if len(cluster_col) == 1:
+            cluster_ids = compressed[cluster_col[0]].to_numpy()
+        else:
+            # Multi-way: stack all cluster columns into 2D array
+            cluster_ids = compressed.select(cluster_col).to_numpy()
+        
         n_g = compressed["_n"].to_numpy()
         sum_y_g = compressed["_sum_y"].to_numpy()
         if sparse.issparse(X):
             yhat_g = np.asarray(X @ beta).flatten()
         else:
             yhat_g = X @ beta
-        e0_g = sum_y_g - n_g * yhat_g  # ẽ⁰ = ỹ⁰ - ñ ⊙ ŷ
+        e0_g = sum_y_g - n_g * yhat_g
     
     # Extract number of x columns INCLUDING intercept
     k_x = len(x_cols) + 1
     x_cols_with_intercept = all_cols[:k_x]
 
-
     # Standard errors - pass x_cols_with_intercept
     se, n_clusters = compute_se_compress(
         XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X, 
-        x_cols_with_intercept,  # Now includes '(Intercept)'
+        x_cols_with_intercept,
         cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
     )
     
     # Extract coefficients for x_cols (excluding intercept from results)
-    beta_x = beta[1:k_x]  # Skip intercept
-    se_x = se[1:]  # Skip intercept
-    
+    beta_x = beta[1:k_x]
+    se_x = se[1:]
     
     return LeanFEResult(
         coefficients=dict(zip(x_cols, beta_x)),
@@ -907,53 +814,27 @@ def leanfe_compress_duckdb(
     table_ref: str,
     weights: str | None = None,
     vcov: str = "iid",
-    cluster_col: str | None = None,
+    cluster_col: str | list[str] | None = None,  # ← Changed to accept list
     ssc: bool = False
 ) -> LeanFEResult:
     """
     Execute high-dimensional fixed effects regression via data compression.
     Backend: DuckDB.
-
-    Compresses data into unique groups of (regressors + fixed effects) to solve 
-    WLS efficiently. Returns estimates.
-
-    Parameters
-    ----------
-    con : DuckDBPyConnection
-        Connection to a DuckDB (either persistent or in-memory).
-    y_col : str
-        Dependent variable name.
-    x_cols : list[str]
-        Independent variable names.
-    fe_cols : list[str]
-        Fixed effect column names.
-    weights : str, optional
-        Weight column name.
-    vcov : {"iid", "cluster"}, default "iid"
-        Variance-covariance type.
-    cluster_col : str, optional
-        Column for clustered SEs; required if vcov="cluster".
-    ssc : bool, default False
-        Apply small-sample correction.
-
-    Returns
-    -------
-    dict
-        Results containing:
-        - coefficients, std_errors: Mappings for x_cols.
-        - n_obs, n_compressed, compression_ratio: Data scale metrics.
-        - df_resid, rss, n_clusters: Model fit statistics.
     """
+    # Normalize cluster_col to list
+    if cluster_col is not None and not isinstance(cluster_col, list):
+        cluster_col = [cluster_col]
+    
     # Compress data
     compressed, n_obs = compress_duckdb(
         con, y_col, x_cols, fe_cols, table_ref, weights, 
-        cluster_col=cluster_col if vcov.lower() == "cluster" else None
+        cluster_col=cluster_col
     )
 
     n_compressed = len(compressed)
     compression_ratio = (n_compressed/n_obs)    
 
-    # Build design matrix - all_cols now includes '(Intercept)'
+    # Build design matrix
     X, Y, wts, all_cols, n_fe_levels = build_design_matrix(
         compressed, x_cols, fe_cols
     )
@@ -968,12 +849,18 @@ def leanfe_compress_duckdb(
     p = len(all_cols)
     df_resid = n_obs - p
     
-    # For cluster SEs, compute e0_g = sum_y - n * yhat (sum of residuals per group)
+    # For cluster SEs, compute e0_g
     cluster_ids = None
     e0_g = None
     n_clusters = None
     if vcov.lower() == "cluster" and cluster_col is not None:
-        cluster_ids = compressed[cluster_col]
+        # ← KEY FIX: Get ALL cluster columns, not just the first one
+        if len(cluster_col) == 1:
+            cluster_ids = compressed[cluster_col[0]]
+        else:
+            # Multi-way: stack all cluster columns into 2D array
+            cluster_ids = np.column_stack([compressed[col] for col in cluster_col])
+        
         n_g = compressed["_n"]
         sum_y_g = compressed["_sum_y"]
         if sparse.issparse(X):
@@ -986,16 +873,16 @@ def leanfe_compress_duckdb(
     k_x = len(x_cols) + 1
     x_cols_with_intercept = all_cols[:k_x]
     
-    # Standard errors - pass x_cols_with_intercept
+    # Standard errors
     se, n_clusters = compute_se_compress(
         XtX_inv, rss_total, rss_g, n_obs, df_resid, vcov, X,
-        x_cols_with_intercept,  # Now includes '(Intercept)'
+        x_cols_with_intercept,
         cluster_ids=cluster_ids, e0_g=e0_g, ssc=ssc
     )
     
-    # Extract coefficients for x_cols (excluding intercept from results)
-    beta_x = beta[1:k_x]  # Skip intercept
-    se_x = se[1:]  # Skip intercept
+    # Extract coefficients for x_cols (excluding intercept)
+    beta_x = beta[1:k_x]
+    se_x = se[1:]
     
     return LeanFEResult(
         coefficients=dict(zip(x_cols, beta_x)),

@@ -69,51 +69,46 @@ def _multiway_cluster_vcov(
 ) -> np.ndarray:
     """
     Compute multi-way clustered variance-covariance matrix.
-    Uses Cameron-Gelbach-Miller (2011) approach.
+    Uses Cameron-Gelbach-Miller (2011) approach with fixest-compatible SSC.
+    
+    Implementation matches fixest defaults:
+    - G.df = "min": Single G_min/(G_min-1) adjustment at the end
+    - Components are accumulated WITHOUT per-component G/(G-1) adjustment
+    - K adjustment (n-1)/(n-K) applied separately if ssc=True
     """
-
+    
     n_ways = cluster_ids.shape[1]
     vcov_matrix = np.zeros_like(XtX_inv)
-
-    # We'll collect first-order cluster counts to compute the "G_min" correction
-    # (fixest default: use G_min/(G_min-1) once on the final VCOV).
     n_clusters_list = []
 
     # Sum over all non-empty subsets with alternating signs
     for k in range(1, n_ways + 1):
         sign = (-1) ** (k - 1)
-
-        # Iterate over all k-way combinations
+ 
         for idx_combo in combinations(range(n_ways), k):
-            # Create intersection cluster ID
             if k == 1:
-                intersect_ids = cluster_ids[:, idx_combo[0]].astype(str)  # Ensure string type
+                intersect_ids = cluster_ids[:, idx_combo[0]]
             else:
-                # Concatenate cluster IDs for intersection
-                intersect_ids = np.array([
-                    '_'.join(str(cluster_ids[i, j]) for j in idx_combo)
-                    for i in range(n_obs)
-                ])
+                arr = np.column_stack([cluster_ids[:, j] for j in idx_combo])
+                _, cluster_map = np.unique(arr, axis=0, return_inverse=True)
+                intersect_ids = cluster_map
 
-            # Get unique clusters and build indicator matrix
             unique_clusters, cluster_map = np.unique(intersect_ids, return_inverse=True)
             n_clusters = len(unique_clusters)
-
-            # Skip subsets that don't form multiple clusters (can't form cluster VCOV)
+            
             if n_clusters <= 1:
+                if k == 1:
+                    n_clusters_list.append(n_clusters)
                 continue
 
-            # Store first-order cluster counts for reporting / G_min if this is size-1 subset
             if k == 1:
                 n_clusters_list.append(n_clusters)
 
-            # Build sparse cluster indicator matrix
             W_C = sparse.csr_matrix(
                 (np.ones(n_obs), (np.arange(n_obs), cluster_map)),
                 shape=(n_obs, n_clusters)
             )
-
-            # Compute scores
+            
             if weights is not None:
                 X_resid = X * (resid * weights)[:, np.newaxis]
             else:
@@ -122,25 +117,21 @@ def _multiway_cluster_vcov(
             scores = W_C.T @ X_resid
             meat = scores.T @ scores
 
-            # NOTE: we do NOT apply the per-component G/(G-1) adjustment here.
-            # The alternating-sum is computed on the unadjusted components and
-            # a single G_min/(G_min-1) correction is applied once below (fixest default).
+            # Accumulate WITHOUT per-component G/(G-1) adjustment
             vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
 
-    # Small-sample cluster correction: apply G_min/(G_min-1) once if requested (fixest default).
-    if ssc and len(n_clusters_list) > 0:
+    # Apply single G_min/(G_min-1) adjustment (fixest default with G.df="min")
+    if len(n_clusters_list) > 0:
         G_min = min(n_clusters_list)
         if G_min > 1:
             vcov_matrix *= (G_min / (G_min - 1))
 
-    # Small-sample K adjustment ((n-1)/(n-K)) if requested — apply once at end.
+    # Apply K small-sample correction if requested
     if ssc:
-        # df_resid is expected to be n - K in caller code
-        vcov_matrix *= (n_obs / df_resid)  # keep same scaling as HC1 handling (n / df_resid)
-        # If you prefer the (n-1)/(n-K) variant, adjust to: vcov_matrix *= ((n_obs - 1) / df_resid)
+        vcov_matrix *= ((n_obs - 1) / df_resid)
 
     return vcov_matrix
-            
+    
 def _parse_i_term(term: str) -> tuple[str, str | None]:
     """
     Parse i() term with optional reference category.
