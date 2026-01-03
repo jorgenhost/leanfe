@@ -4,6 +4,7 @@ Polars-based fixed effects regression implementation.
 Optimized for speed using Polars LazyFrame/DataFrame operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
+from scipy.special import it2struve0, it2j0y0
 import polars as pl
 import numpy as np
 import polars.selectors as cs
@@ -324,74 +325,60 @@ def leanfe_polars(
 
     if strategy == 'alt_proj':
         print('Using FWL/alternating projections strategy...')
-        # Fall back to FWL demeaning for cluster SEs or IV
-        # Extract weights if provided
-        if weights is not None:
-            w = lf.select(weights).collect().to_numpy().flatten()
-        else:
-            w = None
-        
-        # Drop singletons
-        df = lf.collect()
 
-        prev_len = len(df) + 1
-        while len(df) < prev_len:
-            prev_len = len(df)
-            for fe in fe_cols:
-                df = df.filter(pl.len().over(fe) > 1)
-                
-        n_obs = len(df)
-        cols_to_demean = [y_col] + x_cols + instruments
-        
+        # Drop singletons (keep as LazyFrame)
+        EXPRS = [
+            pl.len().over(fe) > 1
+            for fe in fe_cols
+        ]
+        lf = lf.filter(pl.all_horizontal(EXPRS))
+
         # Order FEs by cardinality (low-card first) for faster convergence
-        # Low-cardinality FEs have fewer groups, making GROUP BY operations faster.
-        # Processing them first quickly reduces variation in the data.
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        
-        # Use a slightly tighter tolerance internally for alt_proj to reduce tiny residual differences
-        local_tol = min(demean_tol, 1e-12)
-        
-        # FWL demeaning
+
+        cols_to_demean = [y_col] + x_cols + instruments
+
+        # FWL demeaning - all operations stay lazy
         for it in range(1, max_iter + 1):
             for fe in fe_cols_ordered:
                 if weights is not None:
-                    # We don't unnecessarily create extra demeaned cols, we keep the same name
                     demean_exprs = [
-                        (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) / 
+                        (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
                         pl.col(weights).sum().over(fe)).alias(c)
                         for c in cols_to_demean
                     ]
                 else:
                     demean_exprs = [
-                        (pl.col(c)-pl.col(c).mean().over(fe)).alias(c)
+                        (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
                         for c in cols_to_demean
-                ]
-
-                df = df.with_columns(
+                    ]
+                
+                # Directly overwrite columns in place
+                lf = lf.with_columns_seq(
                     demean_exprs
-                )            
-            if it >= 3:
-                max_mean = max(
-                    df.select(pl.col(y_col).mean().over(fe).abs().max()).item()
-                    for fe in fe_cols
                 )
-                if max_mean < local_tol:
+            
+            # Check convergence - only collect for this check if necessary
+            if it >= 3:
+                check_exprs = [
+                    pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
+                    for fe in fe_cols
+                ]                
+                max_mean = lf.select(pl.max_horizontal(check_exprs)).max().collect().item()
+                if max_mean < demean_tol:
                     break
-    
-        # Add explicit intercept column so X ordering matches compress path
-        df = df.with_columns(pl.lit(1.0).alias('(Intercept)'))
-
-    # Extract X and Y for OLS/IV solve
-    # If we entered alt_proj above, df is defined. Otherwise fall back to lf.collect() -> df
-    if 'df' not in locals():
-        df = lf.collect()
-    
-    # Build X including intercept if present in df
-    if '(Intercept)' in df.columns:
-        X = df.select(['(Intercept)'] + x_cols).to_numpy()
+    df = lf.collect()
+    # Extract weights AFTER collection
+    if weights is not None:
+        w = df.select(weights).to_numpy().flatten()
     else:
-        # No explicit intercept: follow old behavior but keep degrees-of-freedom calculation
-        X = df.select(x_cols).to_numpy()
+        w = None
+
+    # Get n_obs from the collected DataFrame
+    n_obs = len(df)
+
+    # Build X including intercept if present in df
+    X = df.select(pl.ones(pl.len()), pl.col(x_cols)).to_numpy()    
     Y = df.select(y_col).to_numpy().flatten()
     
     # IV/2SLS or OLS

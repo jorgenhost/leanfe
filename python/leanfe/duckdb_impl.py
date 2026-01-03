@@ -465,9 +465,6 @@ def leanfe_duckdb(
         
     absorbed_df = n_fe_groups - len(fe_cols)
     df_resid = n_obs - k - absorbed_df
-    sigma2_test = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()[0]
-    print(f"sigma2: {sigma2_test}")
-    print(f"1/sigma2: {1/sigma2_test}")
     
     # Compute XtX_inv
     if is_iv:
