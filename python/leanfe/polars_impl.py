@@ -180,7 +180,22 @@ def _run_regression(
         beta_full, X_hat_full = iv_2sls(Y, X, Z, w)
         beta = beta_full[1:] if X.shape[1] > len(x_cols) else beta_full
         X_hat = X_hat_full
+
+        # Compute (X'X)^-1 for IV using Cholesky with fallback
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            X_hat_w = X_hat * sqrt_w[:, np.newaxis]
+            XtX_for_inv = X_hat_w.T @ X_hat_w
+        else:
+            XtX_for_inv = X_hat.T @ X_hat
+        
+        try:
+            L = np.linalg.cholesky(XtX_for_inv)
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(L.shape[0])))
+        except np.linalg.LinAlgError:
+            XtX_inv = np.linalg.inv(XtX_for_inv)
     else:
+        # OLS path: compute XtX, solve for beta, and get XtX_inv in one go
         if w is not None:
             sqrt_w = np.sqrt(w)
             X_w = X * sqrt_w[:, np.newaxis]
@@ -190,21 +205,24 @@ def _run_regression(
         else:
             XtX = X.T @ X
             Xty = X.T @ Y
-        beta_full = np.linalg.solve(XtX, Xty)
+        
+        # Use Cholesky: solve for beta and compute inverse from same factorization
+        try:
+            L = np.linalg.cholesky(XtX)
+            beta_full = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
+            # Compute XtX_inv from same L factor
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(L.shape[0])))
+        except np.linalg.LinAlgError:
+            # Fallback to direct methods
+            beta_full = np.linalg.solve(XtX, Xty)
+            XtX_inv = np.linalg.inv(XtX)
+        
         if X.shape[1] == len(x_cols) + 1:
             beta = beta_full[1:]
         else:
             beta = beta_full
         X_hat = X
-    
-    # Compute (X'X)^-1
-    if w is not None:
-        sqrt_w = np.sqrt(w)
-        X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-        XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
-    else:
-        XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
-    
+
     # Residuals
     resid = Y - X_hat @ beta_full
     
@@ -391,7 +409,7 @@ def leanfe_polars(
             pl.len().over(fe) > 1
             for fe in fe_cols
         ]
-        lf = lf.filter(pl.all_horizontal(EXPRS))
+        lf = lf.filter(pl.all_horizontal(EXPRS)).collect().lazy()
 
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
@@ -414,7 +432,7 @@ def leanfe_polars(
                     ]
 
                 # Directly overwrite columns in place
-                lf = lf.with_columns_seq(
+                lf = lf.with_columns(
                     demean_exprs
                 )
 

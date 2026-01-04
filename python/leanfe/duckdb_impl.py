@@ -153,14 +153,21 @@ def _run_regression_duckdb(
         beta, X_hat = iv_2sls(Y, X, Z, w)
         resid = Y - X_hat @ beta
         
-        # Compute XtX_inv for IV
+        # Compute XtX_inv for IV using Cholesky with fallback
         if w is not None:
             sqrt_w = np.sqrt(w)
-            X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-            XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+            X_for_inv = X_hat * sqrt_w[:, np.newaxis]
         else:
-            XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+            X_for_inv = X_hat
         
+        # Use Cholesky decomposition with fallback
+        try:
+            L = np.linalg.cholesky(X_for_inv.T @ X_for_inv)
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(L.shape[0])))
+        except np.linalg.LinAlgError:
+            # Fallback to direct inverse
+            XtX_inv = np.linalg.inv(X_for_inv.T @ X_for_inv)
+            
         # Cluster IDs for SE computation
         cluster_ids = None
         if vcov == "cluster":
@@ -209,9 +216,17 @@ def _run_regression_duckdb(
                 XtX[i, j] = XtX[j, i] = vals[idx]
                 idx += 1
 
-        beta = np.linalg.solve(XtX, Xty)
-        XtX_inv = np.linalg.inv(XtX)
-        
+        # Use Cholesky decomposition with fallback for both beta and XtX_inv
+        try:
+            L = np.linalg.cholesky(XtX)
+            beta = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
+            # Compute XtX_inv from same L factor
+            XtX_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(L.shape[0])))
+        except np.linalg.LinAlgError:
+            # Fallback to direct methods
+            beta = np.linalg.solve(XtX, Xty)
+            XtX_inv = np.linalg.inv(XtX)
+
         # Compute residuals and store in table
         resid_expr = f'"{y_col}_dm" - (' + " + ".join([f"CAST({b} AS DOUBLE) * \"{col}_dm\"" for b, col in zip(beta, x_cols)]) + ")"
         con.execute(f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"')
