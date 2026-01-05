@@ -7,12 +7,13 @@ Uses YOCO compression automatically for IID/HC1 standard errors.
 import polars as pl
 import numpy as np
 import polars.selectors as cs
+from typing import Literal
 from leanfe.result import LeanFEResult
 from leanfe.common import (
     parse_formula,
     iv_2sls,
-    compute_standard_errors,
 )
+from leanfe.std_errors import compute_standard_errors_polars
 from leanfe.compress import (
     determine_strategy,
     leanfe_compress_polars, 
@@ -143,7 +144,7 @@ def _run_regression(
     x_cols: list[str],
     instruments: list[str],
     weights: str | None,
-    vcov: str,
+    vcov: Literal["iid", "HC1", "cluster"],
     cluster_cols: list[str] | None,
     ssc: bool,
     n_obs: int,
@@ -154,6 +155,7 @@ def _run_regression(
     
     Returns: (beta, se, resid, df_resid, n_clusters, r_squared)
     """
+    assert vcov in ["iid", "HC1", "cluster"], f"Invalid vcov method: {vcov}"
     # Extract weights
     if weights is not None:
         w = df.select(weights).to_numpy().flatten()
@@ -229,35 +231,53 @@ def _run_regression(
     # Degrees of freedom
     df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
     
-    # Cluster IDs
-    cluster_ids = None
-    if vcov == "cluster":
-        if cluster_cols is None:
-            raise ValueError("cluster_cols must be provided when vcov='cluster'")
-        cluster_ids = df.select(cluster_cols).to_numpy()
-        if cluster_ids.ndim == 1:
-            cluster_ids = cluster_ids.reshape(-1, 1)
-    
-    # Standard errors
-    se_full, n_clusters = compute_standard_errors(
-        XtX_inv=XtX_inv,
-        resid=resid,
-        n_obs=n_obs,
-        df_resid=df_resid,
-        vcov=vcov,
-        X=X_hat,
-        weights=w,
-        cluster_ids=cluster_ids,
-        ssc=ssc
-    )
-    
-    # Strip intercept
-    if X.shape[1] == len(x_cols) + 1:
-        se = se_full[1:]
+    # Standard errors - use unified std_errors module for all cases
+    if not is_iv:
+        # For OLS with Polars expressions, pass XtX_inv without intercept dimension
+        # since x_cols doesn't include intercept (data is demeaned)
+        XtX_inv_no_intercept = XtX_inv[1:, 1:] if XtX_inv.shape[0] > len(x_cols) else XtX_inv
+        
+        se, n_clusters = compute_standard_errors_polars(
+            df=df,
+            x_cols=x_cols,
+            XtX_inv=XtX_inv_no_intercept,
+            resid=resid,
+            weights=weights,
+            vcov=vcov,
+            cluster_cols=cluster_cols,
+            n_obs=n_obs,
+            df_resid=df_resid,
+            ssc=ssc,
+            X=None,  # Not needed for OLS
+            is_iv=False
+        )
     else:
-        se = se_full
+        # For IV, use full XtX_inv and X_hat
+        se_full, n_clusters = compute_standard_errors_polars(
+            df=df,
+            x_cols=x_cols,
+            XtX_inv=XtX_inv,
+            resid=resid,
+            weights=weights,
+            vcov=vcov,
+            cluster_cols=cluster_cols,
+            n_obs=n_obs,
+            df_resid=df_resid,
+            ssc=ssc,
+            X=X_hat,
+            is_iv=True
+        )
+        
+        # Strip intercept from IV results
+        if X.shape[1] == len(x_cols) + 1:
+            se = se_full[1:]
+        else:
+            se = se_full
+        
+        # Skip the intercept stripping below for IV
+        return beta, se, resid, df_resid, n_clusters, None
     
-    # R-squared
+    # R-squared (only for OLS path)
     rss = np.sum(resid**2)
     tss = np.sum((Y - np.mean(Y))**2)
     r_squared = 1 - rss / tss if tss > 0 else None
@@ -274,7 +294,7 @@ def leanfe_polars(
     weights: str | None = None,
     demean_tol: float = 1e-10,
     max_iter: int = 500,
-    vcov: str = "iid",
+    vcov: Literal["iid", "HC1", "cluster"] = "iid",
     cluster_cols: list[str] | None = None,
     ssc: bool = True,
     sample_frac: float | None = None
@@ -415,46 +435,63 @@ def leanfe_polars(
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
 
         cols_to_demean = [y_col] + x_cols + instruments
-
-        # FWL demeaning - all operations stay lazy
-        for it in range(1, max_iter + 1):
-            for fe in fe_cols_ordered:
-                if weights is not None:
-                    demean_exprs = [
-                        (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
-                        pl.col(weights).sum().over(fe)).alias(c)
-                        for c in cols_to_demean
-                    ]
-                else:
-                    demean_exprs = [
-                        (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
-                        for c in cols_to_demean
-                    ]
+        iterations = 0
+        if len(fe_cols) == 1:
+            fe = fe_cols[0]
+            if weights is not None:
+                demean_exprs = [
+                    (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
+                    pl.col(weights).sum().over(fe)).alias(c)
+                    for c in cols_to_demean
+                ]
+            else:
+                demean_exprs = [
+                    (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
+                    for c in cols_to_demean
+                ]
+            lf = lf.with_columns(
+                demean_exprs
+            )
+        else:
+            # FWL demeaning - all operations stay lazy
+            for it in range(1, max_iter + 1):
+                for fe in fe_cols_ordered:
+                    if weights is not None:
+                        demean_exprs = [
+                            (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
+                            pl.col(weights).sum().over(fe)).alias(c)
+                            for c in cols_to_demean
+                        ]
+                    else:
+                        demean_exprs = [
+                            (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
+                            for c in cols_to_demean
+                        ]
 
                 # Directly overwrite columns in place
                 lf = lf.with_columns(
                     demean_exprs
                 )
 
-            # Check convergence - only collect for this check if necessary
-            if it >= 3:
-                check_exprs = [
-                    pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
-                    for fe in fe_cols
-                ]
-                max_mean = lf.select(pl.max_horizontal(check_exprs)).max().collect().item()
-                if max_mean < demean_tol:
-                    iterations = it
-                    break
-            iterations = it
+                # Check convergence - only collect for this check if necessary
+                if it >= 3:
+                    check_exprs = [
+                        pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
+                        for fe in fe_cols
+                    ]
+                    max_mean = lf.select(pl.max_horizontal(check_exprs)).max().collect().item()
+                    if max_mean < demean_tol:
+                        iterations = it
+                        break
+                iterations = it
 
-        df = lf.collect()
+        df = lf.select(needed_cols).collect()
         unique_counts = df.select([
             pl.col(fe).n_unique() for fe in fe_cols
         ])
-        # Sum the results and calculate the absorbed degrees of freedom
-        # .row(0) gets the first row as a tuple, sum() adds them up
-        absorbed_df = sum(unique_counts.row(0)) - len(fe_cols)
+        # .row(0) gets the first row as a tuple - this is our fe_dims!
+        fe_dims = unique_counts.row(0)
+        absorbed_df = sum(fe_dims) - len(fe_cols)
         n_obs = len(df)
 
         # Calculate final residual degrees of freedom
@@ -465,6 +502,7 @@ def leanfe_polars(
         print('Using simple OLS strategy (no fixed effects)...')
         iterations = 0
         absorbed_df = 0
+        fe_dims = None
         df = lf.collect()    
         n_obs = len(df)
     else:
@@ -495,6 +533,7 @@ def leanfe_polars(
         df_resid=df_resid,
         formula=formula,
         fe_cols=fe_cols,
+        fe_dims=fe_dims,
         r_squared=r_squared,
         compression_ratio = est_comp_ratio
     )

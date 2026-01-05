@@ -9,13 +9,13 @@ from duckdb import DuckDBPyConnection
 import numpy as np
 import polars as pl
 import uuid
-
+from typing import Literal
 from leanfe.result import LeanFEResult
 from leanfe.common import (
     parse_formula,
     iv_2sls,
-    compute_standard_errors,
 )
+from leanfe.std_errors import compute_standard_errors_duckdb
 from leanfe.compress import (
     determine_strategy,
     leanfe_compress_duckdb, 
@@ -122,7 +122,7 @@ def _run_regression_duckdb(
     x_cols: list[str],
     instruments: list[str],
     weights: str | None,
-    vcov: str,
+    vcov: Literal["iid", "HC1", "cluster"],
     cluster_cols: list[str] | None,
     ssc: bool,
     n_obs: int,
@@ -168,22 +168,65 @@ def _run_regression_duckdb(
             # Fallback to direct inverse
             XtX_inv = np.linalg.inv(X_for_inv.T @ X_for_inv)
             
-        # Cluster IDs for SE computation
-        cluster_ids = None
-        if vcov == "cluster":
+        df_resid = n_obs - k - absorbed_df
+        
+        # For IV, we need to use the numpy-based IV functions from std_errors
+        # since we have X_hat as a numpy array
+        from leanfe.std_errors import (
+            _compute_se_hc1_iv,
+            _compute_se_cluster_oneway_iv, 
+            _compute_se_cluster_multiway_iv
+        )
+        
+        if vcov == "iid":
+            # IID for IV
+            sigma2 = np.sum((w * resid**2 if w is not None else resid**2)) / df_resid
+            se = np.sqrt(np.maximum(sigma2 * np.diag(XtX_inv), 0.0))
+            n_clusters = None
+            
+        elif vcov == "HC1":
+            se, n_clusters = _compute_se_hc1_iv(
+                XtX_inv=XtX_inv,
+                resid=resid,
+                X=X_hat,
+                weights_array=w,
+                n_obs=n_obs,
+                df_resid=df_resid
+            )
+            
+        elif vcov == "cluster":
             if cluster_cols is None:
                 raise ValueError("cluster_cols required for vcov='cluster'")
+            
             if len(cluster_cols) == 1:
                 cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy().flatten()
             else:
                 cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy()
-        
-        df_resid = n_obs - k - absorbed_df
-        
-        se, n_clusters = compute_standard_errors(
-            XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
-            vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
-        )
+            
+            if len(cluster_cols) == 1:
+                se, n_clusters = _compute_se_cluster_oneway_iv(
+                    XtX_inv=XtX_inv,
+                    resid=resid,
+                    X=X_hat,
+                    weights=w,
+                    cluster_ids=cluster_ids,
+                    n_obs=n_obs,
+                    df_resid=df_resid,
+                    ssc=ssc
+                )
+            else:
+                se, n_clusters = _compute_se_cluster_multiway_iv(
+                    XtX_inv=XtX_inv,
+                    resid=resid,
+                    X=X_hat,
+                    weights=w,
+                    cluster_ids=cluster_ids,
+                    n_obs=n_obs,
+                    df_resid=df_resid,
+                    ssc=ssc
+                )
+        else:
+            raise ValueError(f"Unknown vcov type: {vcov}")
         
     else:
         # Build expressions for OLS
@@ -233,128 +276,19 @@ def _run_regression_duckdb(
         
         df_resid = n_obs - k - absorbed_df
         
-        # Compute standard errors
-        n_clusters = None
-        if vcov == "iid":
-            if weights is not None:
-                sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()
-                if sigma2 is None:
-                    raise ValueError('Could not compute sigma²')
-                sigma2 = sigma2[0]
-            else:
-                sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM {tmp_table}").fetchone()
-                if sigma2 is None:
-                    raise ValueError('Could not compute sigma²')
-                sigma2 = sigma2[0]
-            se = np.sqrt(np.maximum(sigma2 * np.diag(XtX_inv), 0.0))
-            
-        elif vcov == "HC1":
-            meat_elements = []
-            for i in range(k):
-                for j in range(i, k):
-                    col_i, col_j = x_cols[i], x_cols[j]
-                    expr = f"SUM({col_i}_dm * {col_j}_dm * _resid * _resid)"
-                    if weights is not None:
-                        expr = f"SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid)"
-                    meat_elements.append(f"{expr} AS m_{i}_{j}")
-            meat_row = con.execute(f"SELECT {', '.join(meat_elements)} FROM {tmp_table}").fetchone()
-            if meat_row is None:
-                raise ValueError('Could not compute meat row')
-            vals = list(meat_row)
-            meat = np.zeros((k, k))
-            idx = 0
-            for i in range(k):
-                for j in range(i, k):
-                    val = float(vals[idx] or 0.0)
-                    meat[i, j] = meat[j, i] = val
-                    idx += 1
-            vcov_matrix = XtX_inv @ meat @ XtX_inv
-            se = np.sqrt(np.maximum((n_obs / df_resid) * np.diag(vcov_matrix), 0.0))
-            
-        elif vcov == "cluster":
-            if cluster_cols is None:
-                raise ValueError("cluster_cols required for vcov='cluster'")
-            
-            if len(cluster_cols) == 1:
-                # Single-way clustering
-                cluster_id_sql = cluster_cols[0]
-                
-                if weights is not None:
-                    score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" 
-                                for i, col in enumerate(x_cols)]
-                else:
-                    score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" 
-                                for i, col in enumerate(x_cols)]
-                
-                cluster_query = f"""
-                    SELECT {cluster_id_sql} AS cluster_id, {', '.join(score_exprs)} 
-                    FROM {tmp_table} 
-                    GROUP BY 1
-                """
-                score_df = con.execute(cluster_query).pl()
-                n_clusters = len(score_df)
-                
-                S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
-                meat = S.T @ S
-                
-                adj = ((n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) 
-                    if ssc else n_clusters / (n_clusters - 1))
-                vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
-                se = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
-            
-            else:
-                # Multi-way clustering (same as before)
-                from itertools import combinations
-                n_ways = len(cluster_cols)
-                vcov_matrix = np.zeros_like(XtX_inv)
-                n_clusters_list = []
-                
-                for subset_size in range(1, n_ways + 1):
-                    sign = (-1) ** (subset_size - 1)
-                    
-                    for cluster_subset in combinations(range(n_ways), subset_size):
-                        if subset_size == 1:
-                            cluster_id_sql = cluster_cols[cluster_subset[0]]
-                        else:
-                            cols_to_concat = [cluster_cols[i] for i in cluster_subset]
-                            cluster_id_sql = f"CONCAT_WS('_', {', '.join(cols_to_concat)})"
-                        
-                        if weights is not None:
-                            score_exprs = [f"SUM(\"{col}_dm\" * _resid * {weights}) AS score_{i}" 
-                                        for i, col in enumerate(x_cols)]
-                        else:
-                            score_exprs = [f"SUM(\"{col}_dm\" * _resid) AS score_{i}" 
-                                        for i, col in enumerate(x_cols)]
-                        
-                        cluster_query = f"""
-                            SELECT {cluster_id_sql} AS cluster_id, {', '.join(score_exprs)} 
-                            FROM {tmp_table} 
-                            GROUP BY 1
-                        """
-                        score_df = con.execute(cluster_query).pl()
-                        n_clust = len(score_df)
-                        
-                        if subset_size == 1:
-                            n_clusters_list.append(n_clust)
-                        
-                        if n_clust <= 1:
-                            continue
-                        
-                        S = score_df.select([f"score_{i}" for i in range(k)]).to_numpy()
-                        meat = S.T @ S
-                        
-                        vcov_matrix += sign * (XtX_inv @ meat @ XtX_inv)
-                
-                if len(n_clusters_list) > 0:
-                    G_min = min(n_clusters_list)
-                    if G_min > 1:
-                        vcov_matrix *= (G_min / (G_min - 1))
-                
-                if ssc:
-                    vcov_matrix *= ((n_obs - 1) / df_resid)
-                
-                se = np.sqrt(np.maximum(np.diag(vcov_matrix), 0.0))
-                n_clusters = tuple(n_clusters_list)
+        # Compute standard errors using std_errors module
+        se, n_clusters = compute_standard_errors_duckdb(
+            con=con,
+            tmp_table=tmp_table,
+            x_cols=x_cols,
+            XtX_inv=XtX_inv,
+            weights=weights,
+            vcov=vcov,
+            cluster_cols=cluster_cols,
+            n_obs=n_obs,
+            df_resid=df_resid,
+            ssc=ssc
+        )
     
     return beta, se, df_resid, n_clusters
 
@@ -368,7 +302,7 @@ def leanfe_duckdb(
     weights: str | None = None,
     demean_tol: float = 1e-8,
     max_iter: int = 500,
-    vcov: str = "iid",
+    vcov: Literal["iid", "HC1", "cluster"] = "iid",
     cluster_cols: list[str] | None = None,
     ssc: bool = False,
     sample_frac: float | None = None,
@@ -545,6 +479,7 @@ def leanfe_duckdb(
             raise ValueError("Strategy 'alt_proj' requires FE-cols. Use strategy='ols' instead for OLS without FE.")
         print('Using FWL/alternating projections strategy...')
         
+        it = 0
         # Drop singletons
         if fe_cols:
             fe_filter = " OR ".join([f'"{fe}" IN (SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1)' for fe in fe_cols])
@@ -557,76 +492,116 @@ def leanfe_duckdb(
         else:
             n_obs = n_obs_initial
 
-        # Create working table with _dm columns
-        cols_to_demean = [y_col] + x_cols + instruments
-        cols_to_keep = cols_to_demean + fe_cols
-        if cluster_cols is not None:
-            for c in cluster_cols:
-                if c not in cols_to_keep:
-                    cols_to_keep.append(c)
-        if weights is not None and weights not in cols_to_keep:
-            cols_to_keep.append(weights)
+        # If there is exactly one FE, perform exact one-pass demeaning (no iterations).
+        if len(fe_cols) == 1:
+            fe = fe_cols[0]
+            cols_to_demean = [y_col] + x_cols + instruments
+            # Build aggregation expressions (weighted or unweighted)
+            if weights is not None:
+                agg_exprs = ", ".join([
+                    f"SUM({c} * {weights}) / SUM({weights}) AS {c}_mean"
+                    for c in cols_to_demean
+                ])
+            else:
+                agg_exprs = ", ".join([
+                    f"AVG({c}) AS {c}_mean"
+                    for c in cols_to_demean
+                ])
+            # Create small FE means table
+            con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_exprs} FROM "{tmp_table}" GROUP BY 1')
+            # Left join and compute demeaned columns in one pass
+            subtract_exprs = ", ".join([f'd."{c}" - COALESCE(m.{c}_mean, 0) as {c}_dm' for c in cols_to_demean])
+            other_cols_str = ", ".join([f'd."{c}"' for c in (cols_to_demean + fe_cols + (cluster_cols or []) + ([weights] if weights else []))])
+            # Build final temp table replacing original with _dm columns included
+            con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS
+                SELECT {other_cols_str}, {subtract_exprs}
+                FROM "{tmp_table}" d
+                LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
+            """)
+            # Compute fe_dims and absorbed_df for the single FE
+            fe_dims_result = con.execute(f'SELECT COUNT(DISTINCT "{fe}") FROM "{tmp_table}"').fetchone()
+            if fe_dims_result is not None:
+                fe_count = int(fe_dims_result[0])
+                fe_dims = (fe_count,)
+                absorbed_df = fe_count - 1
+            else:
+                fe_dims = None
+                absorbed_df = 0
 
-        work_table = mk_tmp("work")
-        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
-        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
-        con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
-        tmp_table = work_table
-
-        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        dm_cols = [f"{col}_dm" for col in cols_to_demean]
-
-        # Iterative demeaning
-        for it in range(1, max_iter + 1):
-            for fe in fe_cols_ordered:
-                if weights is not None:
-                    agg_expr = ", ".join([f"SUM({c} * {weights}) / SUM({weights}) as {c}_mean" for c in dm_cols])
-                else:
-                    agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
-
-                con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_expr} FROM "{tmp_table}" GROUP BY 1')
-
-                other_cols_str = ", ".join([f'd."{c}"' for c in cols_to_keep])
-                subtract_expr = ", ".join([f'd.{c} - COALESCE(m.{c}_mean, 0) as {c}' for c in dm_cols])
-
-                con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS 
-                    SELECT {other_cols_str}, {subtract_expr}
-                    FROM "{tmp_table}" d
-                    LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
-                """)
-                
-            if it >= 3:
-                avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
-                avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
-                fe_list = ", ".join([f'"{fe}"' for fe in fe_cols])
-                convergence_sql = f"""
-                    SELECT MAX(ABS(val)) 
-                    FROM (
-                        SELECT {avg_exprs} FROM "{tmp_table}" GROUP BY GROUPING SETS ({fe_list})
-                    ) UNPIVOT(val FOR col IN ({avg_names}))
-                """
-                max_err = con.execute(convergence_sql).fetchone()
-                if max_err is None:
-                    raise ValueError('Error in iterative demeaning')
-                max_err = max_err[0]
-                if abs(max_err or 0) < demean_tol:
-                    break
-        
-        # Calculate absorbed df
-        distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
-        n_fe_groups = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
-        if n_fe_groups is not None:
-            n_fe_groups = sum(n_fe_groups)
         else:
-            n_fe_groups = 0
-        absorbed_df = n_fe_groups - len(fe_cols)
+            # Create working table with _dm columns
+            cols_to_demean = [y_col] + x_cols + instruments
+            cols_to_keep = cols_to_demean + fe_cols
+            if cluster_cols is not None:
+                for c in cluster_cols:
+                    if c not in cols_to_keep:
+                        cols_to_keep.append(c)
+            if weights is not None and weights not in cols_to_keep:
+                cols_to_keep.append(weights)
+
+            work_table = mk_tmp("work")
+            select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
+            all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
+            con.execute(f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS SELECT {all_cols}, {select_dm} FROM "{tmp_table}"')
+            tmp_table = work_table
+
+            fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+            dm_cols = [f"{col}_dm" for col in cols_to_demean]
+
+            # Iterative demeaning
+            for it in range(1, max_iter + 1):
+                for fe in fe_cols_ordered:
+                    if weights is not None:
+                        agg_expr = ", ".join([f"SUM({c} * {weights}) / SUM({weights}) as {c}_mean" for c in dm_cols])
+                    else:
+                        agg_expr = ", ".join([f"AVG({c}) as {c}_mean" for c in dm_cols])
+
+                    con.execute(f'CREATE OR REPLACE TEMP TABLE fe_means AS SELECT "{fe}", {agg_expr} FROM "{tmp_table}" GROUP BY 1')
+
+                    other_cols_str = ", ".join([f'd."{c}"' for c in cols_to_keep])
+                    subtract_expr = ", ".join([f'd.{c} - COALESCE(m.{c}_mean, 0) as {c}' for c in dm_cols])
+
+                    con.execute(f"""
+                        CREATE OR REPLACE TEMP TABLE "{tmp_table}" AS 
+                        SELECT {other_cols_str}, {subtract_expr}
+                        FROM "{tmp_table}" d
+                        LEFT JOIN fe_means m ON d."{fe}" = m."{fe}"
+                    """)
+                    
+                if it >= 3:
+                    avg_exprs = ", ".join([f"AVG({c}) AS {c}_avg" for c in dm_cols])
+                    avg_names = ", ".join([f"{c}_avg" for c in dm_cols])
+                    fe_list = ", ".join([f'"{fe}"' for fe in fe_cols])
+                    convergence_sql = f"""
+                        SELECT MAX(ABS(val)) 
+                        FROM (
+                            SELECT {avg_exprs} FROM "{tmp_table}" GROUP BY GROUPING SETS ({fe_list})
+                        ) UNPIVOT(val FOR col IN ({avg_names}))
+                    """
+                    max_err = con.execute(convergence_sql).fetchone()
+                    if max_err is None:
+                        raise ValueError('Error in iterative demeaning')
+                    max_err = max_err[0]
+                    if abs(max_err or 0) < demean_tol:
+                        break
+            
+            # Calculate absorbed df and fe dimensions
+            distinct_fes_query = ", ".join([f"COUNT(DISTINCT {fe})" for fe in fe_cols])
+            fe_dims_result = con.execute(f"SELECT {distinct_fes_query} FROM {tmp_table}").fetchone()
+            if fe_dims_result is not None:
+                fe_dims = fe_dims_result  # This is already a tuple!
+                absorbed_df = sum(fe_dims) - len(fe_cols)
+            else:
+                fe_dims = None
+                absorbed_df = 0
 
     # Handle OLS case (no FE)
     elif strategy == 'ols':
         print('Using simple OLS strategy (no fixed effects)...')
         it = 0
         absorbed_df = 0
+        fe_dims = None
         n_obs = n_obs_initial
         
         # Create working table with _dm columns (just copy the data)
@@ -675,5 +650,6 @@ def leanfe_duckdb(
         df_resid=df_resid,
         formula=formula,
         fe_cols=fe_cols,
+        fe_dims=fe_dims,
         compression_ratio = est_comp_ratio
     )

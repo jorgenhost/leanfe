@@ -1100,6 +1100,12 @@ def leanfe_compress_polars(
         compressed, x_cols, fe_cols
     )
     
+    # Compute FE dimensions (unique count for each FE)
+    if fe_cols:
+        fe_dims = tuple(compressed.select([pl.col(fe).n_unique() for fe in fe_cols]).row(0))
+    else:
+        fe_dims = None
+    
     # Solve WLS
     beta, XtX_inv = solve_wls(design_matrix, Y, wts)
     
@@ -1163,7 +1169,8 @@ def leanfe_compress_polars(
         vcov_type=vcov,
         df_resid=df_resid,
         rss=rss_total,
-        n_clusters=n_clusters
+        n_clusters=n_clusters,
+        fe_dims=fe_dims
     )
 
 
@@ -1225,6 +1232,12 @@ def leanfe_compress_duckdb(
     design_matrix, Y, wts, all_cols, n_fe_levels = build_design_matrix(
         compressed, x_cols, fe_cols
     )
+    
+    # Compute FE dimensions (unique count for each FE)
+    if fe_cols:
+        fe_dims = tuple(len(np.unique(compressed._data[fe])) for fe in fe_cols)
+    else:
+        fe_dims = None
     
     # Solve WLS
     beta, XtX_inv = solve_wls(design_matrix, Y, wts)
@@ -1290,5 +1303,6 @@ def leanfe_compress_duckdb(
         vcov_type=vcov,
         df_resid=df_resid,
         rss=rss_total,
-        n_clusters=n_clusters
+        n_clusters=n_clusters,
+        fe_dims=fe_dims
     )

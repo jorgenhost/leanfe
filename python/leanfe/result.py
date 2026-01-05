@@ -34,8 +34,14 @@ class LeanFEResult:
         Whether IV/2SLS was used
     n_instruments : int or None
         Number of instruments (if IV)
-    n_clusters : int or None
+    n_clusters : int or tuple or None
         Number of clusters (if clustered SEs)
+        For multi-way clustering, tuple with count for each dimension
+    fe_cols : list or dict or None
+        Fixed effect column names
+    fe_dims : tuple or None
+        Fixed effect dimensions (n_unique for each FE)
+        Example: (50, 100) means 50 groups in first FE, 100 in second FE
     df_resid : int
         Residual degrees of freedom
     r_squared : float or None
@@ -60,7 +66,8 @@ class LeanFEResult:
         rss: float | None = None,
         tss: float | None = None,
         formula: str | None = None,
-        fe_cols: list[str] | dict[str, Any] | None = None
+        fe_cols: list[str] | dict[str, Any] | None = None,
+        fe_dims: tuple[int, ...] | None = None
     ):
         self.coefs = coefs
         self.std_errors = std_errors
@@ -79,6 +86,7 @@ class LeanFEResult:
         self.tss = tss
         self.formula = formula
         self.fe_cols = fe_cols or []
+        self.fe_dims = fe_dims
         
         # Compute t-stats and p-values
         self.t_stats = {}
@@ -126,17 +134,29 @@ class LeanFEResult:
         # Model info
         if self.formula:
             lines.append(f"Formula:      {self.formula}")
-            lines.append(f"Observations: {self.n_obs:_}")        
+            lines.append(f"Observations: {self.n_obs:_}")
+        
+        # Fixed effects information
         if self.fe_cols:
-            lines.append(f"Fixed Effects: {', '.join(self.fe_cols)}")
-        if isinstance(self.fe_cols, dict):
-            for fe, count in self.fe_cols.items():
-                lines.append(f"Fixed Effect ({fe}): {count:_} groups")
+            if isinstance(self.fe_cols, list) and self.fe_cols:
+                lines.append(f"Fixed Effects: {', '.join(self.fe_cols)}")
+                # Display dimensionality if available
+                if self.fe_dims:
+                    fe_dims_str = ' × '.join([f"{d:_}" for d in self.fe_dims])
+                    lines.append(f"FE Dimensions: {fe_dims_str}")
+            elif isinstance(self.fe_cols, dict):
+                for fe, count in self.fe_cols.items():
+                    lines.append(f"Fixed Effect ({fe}): {count:_} groups")
+        
         if self.r_squared_within is not None:
             lines.append(f"R² (within):  {self.r_squared_within:.4f}")
         lines.append(f"Std. Errors:  {self._vcov_description()}")
         if self.n_clusters:
-            lines.append(f"Clusters:     {self.n_clusters:,}")
+            if isinstance(self.n_clusters, tuple):
+                cluster_str = ' × '.join([f"{c:_}" for c in self.n_clusters])
+                lines.append(f"Clusters:     {cluster_str}")
+            else:
+                lines.append(f"Clusters:     {self.n_clusters:_}")
         
         lines.append("-" * 70)
         
@@ -237,6 +257,7 @@ class LeanFEResult:
             'n_compressed': wrap_int(self.n_compressed),
             'compression_ratio': self.compression_ratio,
             'fe_cols': self.fe_cols,
+            'fe_dims': self.fe_dims,
             'iterations': self.iterations,
             'vcov_type': self.vcov_type,
             'is_iv': self.is_iv,
