@@ -16,7 +16,7 @@ class LeanFEResult:
     
     Attributes
     ----------
-    coefficients : dict
+    coefs : dict
         Coefficient estimates by variable name
     std_errors : dict
         Standard errors by variable name
@@ -44,7 +44,7 @@ class LeanFEResult:
     
     def __init__(
         self,
-        coefficients: dict[str, float],
+        coefs: dict[str, float],
         std_errors: dict[str, float],
         n_obs: int,
         vcov_type: str,           
@@ -62,7 +62,7 @@ class LeanFEResult:
         formula: str | None = None,
         fe_cols: list[str] | dict[str, Any] | None = None
     ):
-        self.coefficients = coefficients
+        self.coefs = coefs
         self.std_errors = std_errors
         self.n_obs = n_obs
         self.iterations = iterations
@@ -72,7 +72,7 @@ class LeanFEResult:
         self.is_iv = is_iv
         self.n_instruments = n_instruments
         self.n_clusters = n_clusters
-        self.df_resid = df_resid or (n_obs - len(coefficients))
+        self.df_resid = df_resid or (n_obs - len(coefs))
         self.r_squared = r_squared
         self.r_squared_within = r_squared_within
         self.rss = rss
@@ -83,9 +83,9 @@ class LeanFEResult:
         # Compute t-stats and p-values
         self.t_stats = {}
         self.p_values = {}
-        for var in coefficients:
+        for var in coefs:
             if std_errors[var] > 0:
-                t = coefficients[var] / std_errors[var]
+                t = coefs[var] / std_errors[var]
                 self.t_stats[var] = t
                 # Two-tailed p-value
                 self.p_values[var] = 2 * (1 - stats.t.cdf(abs(t), self.df_resid))
@@ -111,7 +111,7 @@ class LeanFEResult:
     
     def __repr__(self) -> str:
         """Short representation."""
-        n_coef = len(self.coefficients)
+        n_coef = len(self.coefs)
         return f"LeanFEResult(n_obs={self.n_obs:_}, n_coef={n_coef}, vcov='{self.vcov_type}')"    
     def __str__(self) -> str:
         """Formatted regression table output."""
@@ -144,9 +144,9 @@ class LeanFEResult:
         lines.append(f"{'Variable':<20} {'Estimate':>12} {'Std.Err':>12} {'t-stat':>10} {'p-value':>10}")
         lines.append("-" * 70)
         
-        # Coefficients
-        for var in self.coefficients:
-            coef = self.coefficients[var]
+        # coefs
+        for var in self.coefs:
+            coef = self.coefs[var]
             se = self.std_errors[var]
             t = self.t_stats[var]
             p = self.p_values[var]
@@ -179,8 +179,8 @@ class LeanFEResult:
     def coef(self, var: str | None = None):
         """Get coefficient(s). If var is None, returns all as dict."""
         if var is None:
-            return self.coefficients.copy()
-        return self.coefficients.get(var)
+            return self.coefs.copy()
+        return self.coefs.get(var)
     
     def se(self, var: str | None = None):
         """Get standard error(s). If var is None, returns all as dict."""
@@ -218,8 +218,8 @@ class LeanFEResult:
         t_crit = stats.t.ppf(1 - alpha/2, self.df_resid)
         
         ci = {}
-        for var in self.coefficients:
-            coef = self.coefficients[var]
+        for var in self.coefs:
+            coef = self.coefs[var]
             se = self.std_errors[var]
             ci[var] = (coef - t_crit * se, coef + t_crit * se)
         return ci
@@ -229,7 +229,7 @@ class LeanFEResult:
         """Convert to dictionary with visual underscores for integers."""
         return {
             'formula': self.formula,
-            'coefficients': self.coefficients,
+            'coefs': self.coefs,
             'std_errors': self.std_errors,
             't_stats': self.t_stats,
             'p_values': self.p_values,

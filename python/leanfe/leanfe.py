@@ -15,7 +15,7 @@ def leanfe(
     data: str | pl.DataFrame | pl.LazyFrame | None = None,
     y_col: str | None = None,
     x_cols: list[str] | None = None,
-    fe_cols: list[str] | None = None,
+    fe_cols: list[str]  = [],
     formula: str | None = None,
     strategy: str = 'auto',
     weights: str | None = None,
@@ -74,7 +74,7 @@ def leanfe(
     -------
     dict
         Dictionary containing:
-        - coefficients: dict mapping variable names to coefficient estimates
+        - coefs: dict mapping variable names to coefficient estimates
         - std_errors: dict mapping variable names to standard errors
         - n_obs: number of observations used
         - iterations: number of demeaning iterations
@@ -107,7 +107,7 @@ def leanfe(
     
     >>> from leanfe import leanfe
     >>> result = leanfe(df, formula="y ~ treatment | customer + product")
-    >>> print(result['coefficients']['treatment'])
+    >>> print(result['coefs']['treatment'])
     
     With clustered standard errors:
     

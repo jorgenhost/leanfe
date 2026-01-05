@@ -305,7 +305,7 @@ def compute_standard_errors(
     ssc: bool = False
 ) -> tuple[np.ndarray, int | tuple | None]:
     """
-    Compute standard errors for OLS/IV coefficients.
+    Compute standard errors for OLS/IV coefs.
     
     Multi-way clustering uses the Cameron-Gelbach-Miller (2011) approach:
     For 2-way: V = V1 + V2 - V12
@@ -597,7 +597,7 @@ def build_result(
         Result object with formatted output
     """
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta)),
+        coefs=dict(zip(x_cols, beta)),
         std_errors=dict(zip(x_cols, se)),
         n_obs=n_obs,
         iterations=iterations,
@@ -652,11 +652,11 @@ def build_result_dict(
     Returns
     -------
     dict
-        Standardized output with coefficients, std_errors, n_obs, iterations,
+        Standardized output with coefs, std_errors, n_obs, iterations,
         vcov_type, is_iv, n_instruments, n_clusters
     """
     return {
-        'coefficients': dict(zip(x_cols, beta)),
+        'coefs': dict(zip(x_cols, beta)),
         'std_errors': dict(zip(x_cols, se)),
         'n_obs': n_obs,
         'iterations': iterations,

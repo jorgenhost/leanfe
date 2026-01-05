@@ -664,7 +664,7 @@ def leanfe_duckdb(
     _safe_cleanup(con, uid)
 
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta)),
+        coefs=dict(zip(x_cols, beta)),
         std_errors=dict(zip(x_cols, se)),
         n_obs=n_obs,
         iterations=it,

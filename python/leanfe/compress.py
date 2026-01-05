@@ -1151,12 +1151,12 @@ def leanfe_compress_polars(
     # Compute standard errors
     se, n_clusters = compute_se_compress(ctx)
     
-    # Extract coefficients for x_cols (excluding intercept from results)
+    # Extract coefs for x_cols (excluding intercept from results)
     beta_x = beta[1:k_x]
     se_x = se[1:]
     
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta_x)),
+        coefs=dict(zip(x_cols, beta_x)),
         std_errors=dict(zip(x_cols, se_x)),
         n_compressed=n_compressed,
         n_obs=n_obs,
@@ -1277,12 +1277,12 @@ def leanfe_compress_duckdb(
     # Compute standard errors
     se, n_clusters = compute_se_compress(ctx)
     
-    # Extract coefficients for x_cols (excluding intercept)
+    # Extract coefs for x_cols (excluding intercept)
     beta_x = beta[1:k_x]
     se_x = se[1:]
     
     return LeanFEResult(
-        coefficients=dict(zip(x_cols, beta_x)),
+        coefs=dict(zip(x_cols, beta_x)),
         std_errors=dict(zip(x_cols, se_x)),
         n_compressed=n_compressed,
         n_obs=n_obs,
