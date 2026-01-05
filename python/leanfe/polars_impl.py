@@ -286,14 +286,14 @@ def _run_regression(
 
 def leanfe_polars(
     data: str | pl.DataFrame | pl.LazyFrame,
+    demean_tol: float,
     y_col: str | None = None,
     x_cols: list[str] | None = None,
     fe_cols: list[str] | None = None,
     formula: str | None = None,
     strategy: str = 'auto',
     weights: str | None = None,
-    demean_tol: float = 1e-10,
-    max_iter: int = 500,
+    max_iter: int = 25,
     vcov: Literal["iid", "HC1", "cluster"] = "iid",
     cluster_cols: list[str] | None = None,
     ssc: bool = True,
@@ -429,11 +429,10 @@ def leanfe_polars(
             pl.len().over(fe) > 1
             for fe in fe_cols
         ]
-        lf = lf.filter(pl.all_horizontal(EXPRS)).collect().lazy()
+        df = lf.filter(pl.all_horizontal(EXPRS)).collect().lazy()
 
         # Order FEs by cardinality (low-card first) for faster convergence
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-
         cols_to_demean = [y_col] + x_cols + instruments
         iterations = 0
         if len(fe_cols) == 1:
@@ -449,9 +448,9 @@ def leanfe_polars(
                     (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
                     for c in cols_to_demean
                 ]
-            lf = lf.with_columns(
+            df = df.with_columns(
                 demean_exprs
-            )
+            ).select(needed_cols).collect()
         else:
             # FWL demeaning - all operations stay lazy
             for it in range(1, max_iter + 1):
@@ -469,9 +468,9 @@ def leanfe_polars(
                         ]
 
                 # Directly overwrite columns in place
-                lf = lf.with_columns(
+                df = df.with_columns(
                     demean_exprs
-                )
+                ).collect().lazy()
 
                 # Check convergence - only collect for this check if necessary
                 if it >= 3:
@@ -479,13 +478,12 @@ def leanfe_polars(
                         pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
                         for fe in fe_cols
                     ]
-                    max_mean = lf.select(pl.max_horizontal(check_exprs)).max().collect().item()
+                    max_mean = df.select(pl.max_horizontal(check_exprs)).collect().max().item()
                     if max_mean < demean_tol:
                         iterations = it
+                        df = df.select(needed_cols).collect()
                         break
                 iterations = it
-
-        df = lf.select(needed_cols).collect()
         unique_counts = df.select([
             pl.col(fe).n_unique() for fe in fe_cols
         ])
@@ -493,10 +491,9 @@ def leanfe_polars(
         fe_dims = unique_counts.row(0)
         absorbed_df = sum(fe_dims) - len(fe_cols)
         n_obs = len(df)
-
-        # Calculate final residual degrees of freedom
         df_resid = n_obs - (len(x_cols) + 1) - absorbed_df
-        
+
+
     # Handle OLS case (no FE)
     elif strategy == 'ols':
         print('Using simple OLS strategy (no fixed effects)...')

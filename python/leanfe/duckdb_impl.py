@@ -294,14 +294,14 @@ def _run_regression_duckdb(
 
 def leanfe_duckdb(
     data: str | pl.DataFrame | pl.LazyFrame | None,
+    demean_tol: float,
     y_col: str | None = None,
     x_cols: list[str] | None = None,
     fe_cols: list[str] = [],
     formula: str | None = None,
     strategy: str = 'auto',
     weights: str | None = None,
-    demean_tol: float = 1e-8,
-    max_iter: int = 500,
+    max_iter: int = 25,
     vcov: Literal["iid", "HC1", "cluster"] = "iid",
     cluster_cols: list[str] | None = None,
     ssc: bool = False,
