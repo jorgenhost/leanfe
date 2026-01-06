@@ -36,7 +36,7 @@ def compute_standard_errors_polars(
     cluster_cols: list[str] | None,
     n_obs: int,
     df_resid: int,
-    vcov: Literal["iid", "HC1", "cluster"],
+    vcov: Literal["iid", "hc1", "cluster"],
     ssc: bool = True,
     X: np.ndarray | None = None,
     is_iv: bool = False
@@ -608,7 +608,7 @@ def compute_standard_errors_duckdb(
     x_cols: list[str],
     XtX_inv: np.ndarray,
     weights: str | None,
-    vcov: Literal["iid", "HC1", "cluster"],
+    vcov: Literal["iid", "hc1", "cluster"],
     cluster_cols: list[str] | None,
     n_obs: int,
     df_resid: int,

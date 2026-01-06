@@ -144,7 +144,7 @@ def _run_regression(
     x_cols: list[str],
     instruments: list[str],
     weights: str | None,
-    vcov: Literal["iid", "HC1", "cluster"],
+    vcov: Literal["iid", "hc1", "cluster"],
     cluster_cols: list[str] | None,
     ssc: bool,
     n_obs: int,
@@ -155,7 +155,7 @@ def _run_regression(
     
     Returns: (beta, se, resid, df_resid, n_clusters, r_squared)
     """
-    assert vcov in ["iid", "HC1", "cluster"], f"Invalid vcov method: {vcov}"
+    assert vcov in ["iid", "hc1", "cluster"], f"Invalid vcov method: {vcov}"
     # Extract weights
     if weights is not None:
         w = df.select(weights).to_numpy().flatten()
@@ -294,7 +294,7 @@ def leanfe_polars(
     strategy: str = 'auto',
     weights: str | None = None,
     max_iter: int = 25,
-    vcov: Literal["iid", "HC1", "cluster"] = "iid",
+    vcov: Literal["iid", "hc1", "cluster"] = "iid",
     cluster_cols: list[str] | None = None,
     ssc: bool = True,
     sample_frac: float | None = None
@@ -388,6 +388,9 @@ def leanfe_polars(
                 inferred_strategy = 'ols'
             else:
                 inferred_strategy = 'compress'
+
+        elif len(fe_cols) == 1:
+            inferred_strategy = 'demean'
         else:
             inferred_strategy = determine_strategy(
                 vcov, is_iv, fe_cardinality,
@@ -418,10 +421,57 @@ def leanfe_polars(
 
         return result
 
-    if strategy == 'alt_proj':
+    if strategy == 'demean':
+        if not fe_cols or len(fe_cols) != 1:
+            raise ValueError("Strategy 'demean' requires exactly one FE column.")
+        assert fe_cardinality is not None, "No FE-cardinality computed for strategy='demean'"
+        print("Using simple within-transform (demean) strategy for single FE...")
+
+        fe = fe_cols[0]
+        cols_to_demean = [y_col] + x_cols + instruments
+
+        # Drop singletons (keep as LazyFrame)
+        EXPRS = [pl.len().over(fe) > 1]
+        df = lf.filter(pl.all_horizontal(EXPRS)).collect().lazy()
+
+        # Weighted vs unweighted demeaning
+        if weights is not None:
+            demean_exprs = [
+                (
+                    pl.col(c)
+                    - (pl.col(c) * pl.col(weights)).sum().over(fe)
+                      / pl.col(weights).sum().over(fe)
+                ).alias(c)
+                for c in cols_to_demean
+            ]
+        else:
+            demean_exprs = [
+                (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
+                for c in cols_to_demean
+            ]
+
+        # Apply within transform once and materialize
+        df = (
+            df.with_columns(demean_exprs)
+              .select(needed_cols)
+              .collect()
+        )
+
+        # FE dimension and absorbed DF
+        unique_counts = df.select(pl.col(fe).n_unique())
+        fe_dims = unique_counts.row(0)   # (n_levels,)
+        absorbed_df = fe_dims[0] - 1
+        n_obs = len(df)
+        iterations = 1  # single-pass demeaning
+
+
+    elif strategy == 'alt_proj':
         if not fe_cols:
-            raise ValueError("Strategy 'alt_proj' requires FE-cols. Use strategy='ols' instead for OLS without FE.")
-        assert fe_cardinality is not None, f"No FE-cardinality compute for strategy = {strategy}"
+            raise ValueError(
+                "Strategy 'alt_proj' requires FE-cols. "
+                "Use strategy='ols' instead for OLS without FE."
+            )
+        assert fe_cardinality is not None, "No FE-cardinality computed for strategy='alt_proj'"
         print('Using FWL/alternating projections strategy...')
 
         # Drop singletons (keep as LazyFrame)
@@ -435,59 +485,52 @@ def leanfe_polars(
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
         cols_to_demean = [y_col] + x_cols + instruments
         iterations = 0
-        if len(fe_cols) == 1:
-            fe = fe_cols[0]
-            if weights is not None:
-                demean_exprs = [
-                    (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
-                    pl.col(weights).sum().over(fe)).alias(c)
-                    for c in cols_to_demean
-                ]
-            else:
-                demean_exprs = [
-                    (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
-                    for c in cols_to_demean
-                ]
-            df = df.with_columns(
-                demean_exprs
-            ).select(needed_cols).collect()
-        else:
-            # FWL demeaning - all operations stay lazy
-            for it in range(1, max_iter + 1):
-                for fe in fe_cols_ordered:
-                    if weights is not None:
-                        demean_exprs = [
-                            (pl.col(c) - (pl.col(c) * pl.col(weights)).sum().over(fe) /
-                            pl.col(weights).sum().over(fe)).alias(c)
-                            for c in cols_to_demean
-                        ]
-                    else:
-                        demean_exprs = [
-                            (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
-                            for c in cols_to_demean
-                        ]
 
-                # Directly overwrite columns in place
-                df = df.with_columns(
-                    demean_exprs
-                ).collect().lazy()
-
-                # Check convergence - only collect for this check if necessary
-                if it >= 3:
-                    check_exprs = [
-                        pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
-                        for fe in fe_cols
+        # Multi-FE FWL demeaning - all operations stay lazy between iterations
+        for it in range(1, max_iter + 1):
+            for fe in fe_cols_ordered:
+                if weights is not None:
+                    demean_exprs = [
+                        (
+                            pl.col(c)
+                            - (pl.col(c) * pl.col(weights)).sum().over(fe)
+                              / pl.col(weights).sum().over(fe)
+                        ).alias(c)
+                        for c in cols_to_demean
                     ]
-                    max_mean = df.select(pl.max_horizontal(check_exprs)).collect().max().item()
-                    if max_mean < demean_tol:
-                        iterations = it
-                        df = df.select(needed_cols).collect()
-                        break
-                iterations = it
+                else:
+                    demean_exprs = [
+                        (pl.col(c) - pl.col(c).mean().over(fe)).alias(c)
+                        for c in cols_to_demean
+                    ]
+
+                # Overwrite columns in place for this FE
+                df = df.with_columns(demean_exprs)
+
+            # Check convergence after cycling all FEs
+            if it >= 3:
+                check_exprs = [
+                    pl.col(y_col).mean().over(fe).abs().alias(f"{y_col}_mean_abs_{fe}")
+                    for fe in fe_cols
+                ]
+                max_mean = (
+                    df.select(pl.max_horizontal(check_exprs))
+                      .collect()
+                      .max()
+                      .item()
+                )
+                if max_mean < demean_tol:
+                    iterations = it
+                    df = df.select(needed_cols).collect()
+                    break
+            iterations = it
+
+        if isinstance(df, pl.LazyFrame):
+            df = df.select(needed_cols).collect()
+
         unique_counts = df.select([
             pl.col(fe).n_unique() for fe in fe_cols
         ])
-        # .row(0) gets the first row as a tuple - this is our fe_dims!
         fe_dims = unique_counts.row(0)
         absorbed_df = sum(fe_dims) - len(fe_cols)
         n_obs = len(df)
