@@ -607,7 +607,7 @@ def leanfe_duckdb(
         if not fe_cols:
             raise ValueError("Strategy 'alt_proj' requires FE-cols.")
         
-        print('Using FWL/alternating projections strategy (Optimized)...')
+        print('Using FWL/alternating projections strategy...')
         
         # 1. Drop NULLs and singleton FE levels (common FE pre-processing)
         if fe_cols:
