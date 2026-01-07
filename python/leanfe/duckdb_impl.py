@@ -547,73 +547,19 @@ def leanfe_duckdb(
         _safe_cleanup(con, uid)
         return result
 
-    # NEW: single-FE fast demeaning strategy
-    if strategy == 'demean':
-        if not fe_cols or len(fe_cols) != 1:
-            raise ValueError("Strategy 'demean' requires exactly one FE column.")
-        fe = fe_cols[0]
-        print("Using simple within-transform (demean) strategy for single FE...")
-
-        # Drop NULL FE and singletons
-        con.execute(f'DELETE FROM "{tmp_table}" WHERE "{fe}" IS NULL')
-        con.execute(
-            f'DELETE FROM "{tmp_table}" WHERE "{fe}" IN ('
-            f'  SELECT "{fe}" FROM "{tmp_table}" GROUP BY 1 HAVING COUNT(*) = 1'
-            f')'
-        )
-
-        n_obs_res = con.execute(f'SELECT COUNT(*) FROM "{tmp_table}"').fetchone()
-        if n_obs_res is None:
-            raise ValueError('Could not fetch number of rows (n_obs)')
-        n_obs = int(n_obs_res[0])
-
-        cols_to_demean = [y_col] + x_cols + instruments
-
-        # Build demeaning expressions: y := y - mean_y | FE, etc.
-        if weights is not None:
-            demean_exprs = [
-                f'{col} - (SUM({col} * "{weights}") OVER (PARTITION BY "{fe}") '
-                f'/ SUM("{weights}") OVER (PARTITION BY "{fe}")) AS {col}_dm'
-                for col in cols_to_demean
-            ]
-        else:
-            demean_exprs = [
-                f'{col} - AVG({col}) OVER (PARTITION BY "{fe}") AS {col}_dm'
-                for col in cols_to_demean
-            ]
-
-        dm_select = ", ".join([f'"{c}"' for c in fe_cols +
-                               (cluster_cols if cluster_cols else []) +
-                               ([weights] if weights else [])] + demean_exprs)
-
-        work_table = mk_tmp("work")
-        con.execute(f"""
-            CREATE TEMPORARY TABLE "{work_table}" AS
-            SELECT {dm_select}
-            FROM "{tmp_table}"
-        """)
-        tmp_table = work_table
-
-        # Absorbed DF: n_levels - 1 for one FE
-        n_u_row = con.execute(f'SELECT COUNT(DISTINCT "{fe}") FROM "{tmp_table}"').fetchone()
-        if n_u_row is None:
-            raise ValueError('Could not fetch FE dimension')
-        fe_dims = (int(n_u_row[0]),)
-        absorbed_df = fe_dims[0] - 1
-        it = 1  # one demeaning pass
-    
-    # Alternating projections / FWL strategy
     if strategy == 'alt_proj':
         if not fe_cols:
             raise ValueError("Strategy 'alt_proj' requires FE-cols.")
         
         print('Using FWL/alternating projections strategy...')
-        
-        # 1. Drop NULLs and singleton FE levels (common FE pre-processing)
+
+        # 1. Drop NULLs and singleton FE levels 
         if fe_cols:
+            # Drop rows with NULL in any FE
             null_filter = " OR ".join([f'"{fe}" IS NULL' for fe in fe_cols])
             con.execute(f'DELETE FROM "{tmp_table}" WHERE {null_filter}')
             
+            # Drop singleton FE levels for each FE
             singleton_conditions = []
             for fe in fe_cols:
                 singleton_conditions.append(
@@ -628,7 +574,6 @@ def leanfe_duckdb(
                     " OR ".join(singleton_conditions)
                 )
 
-        # Refresh N after dropping rows
         n_obs_res = con.execute(
             f'SELECT COUNT(*) FROM "{tmp_table}"'
         ).fetchone()
@@ -640,129 +585,139 @@ def leanfe_duckdb(
         cols_to_demean = [y_col] + x_cols + instruments
         dm_cols = [f"{col}_dm" for col in cols_to_demean]
 
+        # static columns are: FEs, cluster cols, weights
         cols_static = list(dict.fromkeys(
             fe_cols +
             (cluster_cols if cluster_cols else []) +
             ([weights] if weights else [])
         ))
-        static_col_str = ", ".join(f'"{c}"' for c in cols_static)
+        static_col_str = ", ".join(f'"{c}"' for c in cols_static) if cols_static else ""
+
+        # Original values become _dm columns
         select_dm = ", ".join(
             f'"{col}" AS "{col}_dm"' for col in cols_to_demean
         )
 
         work_table = mk_tmp("work")
-        con.execute(f"""
-            CREATE TEMPORARY TABLE "{work_table}" AS 
-            SELECT {static_col_str}, {select_dm}
-            FROM "{tmp_table}"
-        """)
-        tmp_table = work_table
 
-        # 3. Pre-compute denominators per FE (1/sum(w) or 1/count(*))
-        fe_meta_tables: dict[str, str] = {}
-        for fe in fe_cols:
-            meta_table = mk_tmp(f"meta_{fe}")
-            if weights:
-                sql = f"""
-                    CREATE TEMPORARY TABLE "{meta_table}" AS
-                    SELECT "{fe}", 1.0 / SUM("{weights}") AS inv_weight
-                    FROM "{tmp_table}"
-                    GROUP BY 1
-                """
-            else:
-                sql = f"""
-                    CREATE TEMPORARY TABLE "{meta_table}" AS
-                    SELECT "{fe}", 1.0 / COUNT(*) AS inv_weight
-                    FROM "{tmp_table}"
-                    GROUP BY 1
-                """
-            con.execute(sql)
-            fe_meta_tables[fe] = meta_table
+        if cols_static:
+            con.execute(f"""
+                CREATE TEMPORARY TABLE "{work_table}" AS 
+                SELECT {static_col_str}, {select_dm}
+                FROM "{tmp_table}"
+            """)
+        else:
+            con.execute(f"""
+                CREATE TEMPORARY TABLE "{work_table}" AS 
+                SELECT {select_dm}
+                FROM "{tmp_table}"
+            """)
 
-        # Order FEs by cardinality; often helps convergence speed
+        tmp_table = work_table  # from here on, AP operates on work_table
+
+        # 3. Order FEs by cardinality
         fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
 
-        # 4. Prepare reusable SQL fragments for the AP loop
-        keep_exprs = ", ".join(f'd."{c}"' for c in cols_static)
-        subtract_exprs = ", ".join(
-            f'd."{c}" - m."{c}_sum" * t.inv_weight AS "{c}"'
-            for c in dm_cols
-        )
-        # Aggregation expressions for fe_sums
+        # 4. Build common pieces used in the AP loop
+
+        # Aggregation expressions: sums over *_dm, and inv_weight
         if weights:
-            agg_expr_sums = ", ".join(
-                f'SUM("{c}" * "{weights}") AS "{c}_sum"' for c in dm_cols
-            )
+            def fe_sums_sql(fe: str) -> str:
+                sums = ", ".join(
+                    f'SUM(d."{c}" * d."{weights}") AS "{c}_sum"' for c in dm_cols
+                )
+                return f"""
+                    SELECT
+                        d."{fe}",
+                        {sums},
+                        1.0 / SUM(d."{weights}") AS inv_weight
+                    FROM "{tmp_table}" d
+                    GROUP BY 1
+                """
         else:
-            agg_expr_sums = ", ".join(
-                f'SUM("{c}") AS "{c}_sum"' for c in dm_cols
+            def fe_sums_sql(fe: str) -> str:
+                sums = ", ".join(
+                    f'SUM(d."{c}") AS "{c}_sum"' for c in dm_cols
+                )
+                return f"""
+                    SELECT
+                        d."{fe}",
+                        {sums},
+                        1.0 / COUNT(*) AS inv_weight
+                    FROM "{tmp_table}" d
+                    GROUP BY 1
+                """
+
+        # Convergence check expression: max absolute mean adjustment across dm cols
+        def conv_expr() -> str:
+            terms = ", ".join(
+                f'ABS("{c}_sum" * inv_weight)' for c in dm_cols
             )
+            return f"GREATEST({terms})"
 
-        # Convergence check: max absolute adjustment across dm columns
-        check_expr = "GREATEST(" + ", ".join(
-            f'ABS(m."{c}_sum" * t.inv_weight)' for c in dm_cols
-        ) + ")"
-
-        # 5. Iterative demeaning loop (alternating projections)
         it = 0
-        # max_diff = 1.0 
 
         for it in range(1, max_iter + 1):
             max_err = 0.0
 
             for fe in fe_cols_ordered:
-                meta_table = fe_meta_tables[fe]
+                # A. Compute FE sums + inv_weight
+                sums_sql = fe_sums_sql(fe)
+                con.execute(f'CREATE OR REPLACE TEMPORARY TABLE fe_sums AS {sums_sql}')
 
-                # A. fe_sums: FE-level sums for all dm_cols in one pass
-                con.execute(f"""
-                    CREATE OR REPLACE TEMPORARY TABLE fe_sums AS 
-                    SELECT "{fe}", {agg_expr_sums}
-                    FROM "{tmp_table}"
-                    GROUP BY 1
-                """)
-
-                # B. convergence for this FE (max |mean adjustment|)
+                # B. Convergence metric for this FE
                 conv_sql = f"""
-                    SELECT MAX({check_expr})
-                    FROM fe_sums m
-                    JOIN "{meta_table}" t USING ("{fe}")
+                    SELECT MAX({conv_expr()}) AS max_err
+                    FROM fe_sums
                 """
                 cur = con.execute(conv_sql).fetchone()
-                if cur is not None:
-                    cur = cur[0]
-                    max_err = max(max_err, cur)
+                if cur is not None and cur[0] is not None:
+                    cur_err = float(cur[0])
+                    max_err = max(max_err, cur_err)
 
-                # C. update dm columns by subtracting FE means
+                # C. Subtract FE means: overwrite tmp_table in place
+                #    d.<col>_dm - fs.<col>_dm_sum * inv_weight  for all dm_cols
+                keep_static = ", ".join(f'd."{c}"' for c in cols_static) if cols_static else ""
+                if keep_static:
+                    keep_static += ", "
+
+                subtract_exprs = ", ".join(
+                    f'd."{col}_dm" - fs."{col}_dm_sum" * fs.inv_weight AS "{col}_dm"'
+                    for col in cols_to_demean
+                )
+
                 sql_update = f"""
-                    CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS 
-                    SELECT {keep_exprs}, {subtract_exprs}
+                    CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS
+                    SELECT
+                        {keep_static}{subtract_exprs}
                     FROM "{tmp_table}" d
-                    JOIN fe_sums m USING ("{fe}")
-                    JOIN "{meta_table}" t USING ("{fe}")
+                    JOIN fe_sums fs
+                    ON d."{fe}" = fs."{fe}";
                 """
                 con.execute(sql_update)
+
+                # We keep reusing the same fe_sums name with OR REPLACE,
+                # so no need to DROP fe_sums explicitly each time.
 
             if max_err < demean_tol:
                 break
 
-        # 6. Absorbed degrees of freedom (approximate within-FE DF)
+        # 5. Absorbed degrees of freedom (approximate within-FE DF)
         total_fe_levels = 0
         fe_dims: tuple[int, ...] = ()
         for fe in fe_cols:
             n_u = con.execute(
-                f'SELECT COUNT(*) FROM "{fe_meta_tables[fe]}"'
+                f'SELECT COUNT(DISTINCT "{fe}") FROM "{tmp_table}"'
             ).fetchone()
             if n_u is None:
-                raise ValueError('Could not fetch number of rows (n_obs)')
+                raise ValueError('Could not fetch FE dimension')
             n_u = int(n_u[0])
             fe_dims = fe_dims + (n_u,)
             total_fe_levels += n_u
         absorbed_df = total_fe_levels - (len(fe_cols) - 1)
-
-        # Clean up algorithm-specific temps
+        # Clean up
         con.execute("DROP TABLE IF EXISTS fe_sums")
-        for t in fe_meta_tables.values():
-            con.execute(f'DROP TABLE IF EXISTS "{t}"')
+    
 
     # Handle OLS case (no FE demeaning required)
     elif strategy == 'ols':
