@@ -1,0 +1,5 @@
+Dataset,Backend,Strategy,Time (s),Peak RAM (MB)
+HDFE_CLUSTER1,duckdb,alt_proj,9.2698,4598.77
+HDFE_CLUSTER1,polars-lazy,alt_proj,22.7829,5606.81
+HDFE_CLUSTER2,duckdb,alt_proj,10.2984,5371.28
+HDFE_CLUSTER2,polars-lazy,alt_proj,39.5954,4689.43
