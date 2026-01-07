@@ -708,7 +708,7 @@ def leanfe_duckdb(
         # max_diff = 1.0 
 
         for it in range(1, max_iter + 1):
-            max_adjustment_in_cycle = 0.0
+            max_err = 0.0
 
             for fe in fe_cols_ordered:
                 meta_table = fe_meta_tables[fe]
@@ -730,7 +730,7 @@ def leanfe_duckdb(
                 cur = con.execute(conv_sql).fetchone()
                 if cur is not None:
                     cur = cur[0]
-                    max_adjustment_in_cycle = max(max_adjustment_in_cycle, cur)
+                    max_err = max(max_err, cur)
 
                 # C. update dm columns by subtracting FE means
                 sql_update = f"""
@@ -742,7 +742,7 @@ def leanfe_duckdb(
                 """
                 con.execute(sql_update)
 
-            if max_adjustment_in_cycle < demean_tol:
+            if max_err < demean_tol:
                 break
 
         # 6. Absorbed degrees of freedom (approximate within-FE DF)
