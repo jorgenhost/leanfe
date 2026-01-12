@@ -75,3 +75,8 @@ src/*.dll
 
 # Logs
 *.log
+
+# data
+*.pq
+
+python/jbh-leanfe

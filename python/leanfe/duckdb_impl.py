@@ -4,72 +4,380 @@ DuckDB-based fixed effects regression implementation.
 Optimized for memory efficiency using in-database operations.
 Uses YOCO compression automatically for IID/HC1 standard errors.
 """
-
 import duckdb
+from duckdb import DuckDBPyConnection
 import numpy as np
 import polars as pl
-from typing import List, Optional, Union
-
-from .common import (
+import uuid
+from typing import Literal
+from leanfe.result import LeanFEResult
+from leanfe.common import (
     parse_formula,
     iv_2sls,
-    compute_standard_errors,
-    build_result
 )
-from .compress import should_use_compress, leanfe_compress_duckdb
+from leanfe.std_errors import compute_standard_errors_duckdb
+from leanfe.compress import (
+    determine_strategy,
+    leanfe_compress_duckdb, 
+    estimate_compression_ratio
+)
+
+# Hard limit on FE levels when auto-selecting strategy
+MAX_FE_LEVELS = 10_000
 
 
-def leanfe_duckdb(
-    data: Union[str, pl.DataFrame],
-    y_col: Optional[str] = None,
-    x_cols: Optional[List[str]] = None,
-    fe_cols: Optional[List[str]] = None,
-    formula: Optional[str] = None,
-    weights: Optional[str] = None,
-    demean_tol: float = 1e-5,
-    max_iter: int = 500,
-    vcov: str = "iid",
-    cluster_cols: Optional[List[str]] = None,
-    ssc: bool = False,
-    sample_frac: Optional[float] = None
-) -> dict:
-    """
-    Fixed effects regression using DuckDB with optimized memory usage.
+def _safe_cleanup(con, uid_prefix):
+    """Only drops objects created by this specific LeanFE execution."""
+    # Clean up tables/views starting with our unique ID
+    for obj_type in ["TABLE", "VIEW"]:
+        names = con.execute(
+            f"SELECT {obj_type.lower()}_name "
+            f"FROM duckdb_{obj_type.lower()}s "
+            f"WHERE {obj_type.lower()}_name LIKE 'leanfe_%_{uid_prefix}'"
+        ).fetchall()
+        for (name,) in names:
+            con.execute(f"DROP {obj_type} IF EXISTS \"{name}\" CASCADE")
+    # Specifically drop the fixed names used in loops
+    con.execute("DROP TABLE IF EXISTS fe_means")
+
+
+def _expand_factors_duckdb(
+    con: duckdb.DuckDBPyConnection, 
+    factor_vars: list[tuple[str, str | None]],
+    table_name: str = 'data',     
+) -> list[str]:
+    """Expand i(var) into dummies in DuckDB, returning created column names."""
+    # 1. Get unique categories for all factors in one go
+    # Using a single query to fetch metadata is faster than one query per column.
+    case_parts = []
+    dummy_cols = []
     
+    for var, ref in factor_vars:
+        # Fetch categories for this factor
+        categories = [
+            r[0]
+            for r in con.execute(
+                f"SELECT DISTINCT {var} FROM {table_name} ORDER BY 1"
+            ).fetchall()
+        ]
+        ref_cat = ref if ref is not None else categories[0]
+        
+        for cat in categories:
+            if cat == ref_cat:
+                continue
+            if isinstance(cat, str):
+                cat_sql = f"'{cat}'"
+            else:
+                cat_sql = str(cat)
+            col_name = f"{var}_{cat}"
+            # Use CASE statements for bulk expansion
+            case_parts.append(
+                f"CASE WHEN {var} = '{cat_sql}' THEN 1 ELSE 0 END AS {col_name}"
+            )
+            dummy_cols.append(col_name)
+            
+    if case_parts:
+        # Materialize as TEMPORARY to ensure it stays in RAM/temp-storage
+        con.execute(
+            f"CREATE OR REPLACE TEMPORARY TABLE {table_name} AS "
+            f"SELECT *, {', '.join(case_parts)} FROM {table_name}"
+        )
+    return dummy_cols
+
+
+def _expand_interactions_duckdb(
+    con: duckdb.DuckDBPyConnection, 
+    interactions: list[tuple[str, str, str | None]],
+    table_name: str = 'data', 
+) -> list[str]:
+    """
+    Optimized DuckDB interaction expansion using a single SQL pass.
+    """
+    if not interactions:
+        return []
+
+    interaction_exprs = []
+    all_new_cols = []
+
+    for var, factor, ref in interactions:
+        # 1. Fetch distinct categories once per factor
+        cats = [
+            r[0]
+            for r in con.execute(
+                f"SELECT DISTINCT {factor} FROM {table_name} ORDER BY {factor}"
+            ).fetchall()
+        ]
+        
+        # 2. Determine reference category
+        if ref is None:
+            ref_cat = cats[0]
+        else:
+            ref_cat = ref
+            if cats and not isinstance(cats[0], str):
+                try:
+                    ref_cat = type(cats[0])(ref)
+                except (ValueError, TypeError):
+                    ref_cat = ref
+
+        # 3. Build CASE statements for each non-reference category
+        for cat in cats:
+            if cat == ref_cat:
+                continue
+            if isinstance(cat, str):
+                cat_sql = f"'{cat}'"
+            else:
+                cat_sql = str(cat)
+            col_name = f"{var}_{cat}"
+            # Use SQL CASE for the interaction calculation
+            expr = f"CASE WHEN {factor} = '{cat_sql}' THEN {var} ELSE 0 END AS {col_name}"
+            interaction_exprs.append(expr)
+            all_new_cols.append(col_name)
+
+    # 4. Apply all interactions in one single relational operation
+    if interaction_exprs:
+        sql = (
+            f"CREATE OR REPLACE TABLE {table_name} AS "
+            f"SELECT *, {', '.join(interaction_exprs)} FROM {table_name}"
+        )
+        con.execute(sql)
+
+    return all_new_cols
+
+
+def _run_regression_duckdb(
+    con: DuckDBPyConnection,
+    tmp_table: str,
+    y_col: str,
+    x_cols: list[str],
+    instruments: list[str],
+    weights: str | None,
+    vcov: Literal["iid", "hc1", "cluster"],
+    cluster_cols: list[str] | None,
+    ssc: bool,
+    n_obs: int,
+    absorbed_df: int = 0
+) -> tuple[np.ndarray, np.ndarray, int, int | tuple | None]:
+    """
+    Common regression logic for both OLS and FE cases (DuckDB version).
+
     Parameters
     ----------
-    data : str or polars.DataFrame
-        Input data: either DataFrame or path to Parquet file
-    y_col : str, optional
-        Dependent variable column name (optional if formula provided)
-    x_cols : list of str, optional
-        Independent variable column names (optional if formula provided)
-    fe_cols : list of str, optional
-        Fixed effect column names (optional if formula provided)
-    formula : str, optional
-        R-style formula: "y ~ x1 + x2 + x:i(factor) | fe1 + fe2 | z1 + z2" (IV)
-    weights : str, optional
-        Column name for regression weights
-    demean_tol : float, default 1e-5
-        Convergence tolerance for demeaning
-    max_iter : int, default 500
-        Maximum iterations for demeaning
-    vcov : str, default "iid"
-        Variance-covariance estimator: "iid", "HC1", or "cluster"
-    cluster_cols : list of str, optional
-        Clustering variables (required if vcov="cluster")
-    ssc : bool, default False
-        Small sample correction for clustered SEs
-    sample_frac : float, optional
-        Fraction of data to sample (e.g., 0.1 for 10%)
+    tmp_table : str
+        Name of table containing demeaned columns (suffix `_dm`).
+    absorbed_df : int
+        Degrees of freedom absorbed by fixed effects.
     
     Returns
     -------
-    dict
-        coefficients, std_errors, n_obs, iterations, vcov_type, 
-        is_iv, n_instruments, n_clusters
+    beta, se, df_resid, n_clusters
     """
-    # Parse formula if provided
+    k = len(x_cols)
+    is_iv = len(instruments) > 0
+    
+    if is_iv:
+        # Extract demeaned data for IV/2SLS into Polars, then NumPy
+        select_cols = [f"{col}_dm" for col in [y_col] + x_cols + instruments]
+        if weights is not None:
+            select_cols.append(weights)
+        if cluster_cols is not None:
+            select_cols.extend(cluster_cols)
+        
+        result_df = con.execute(
+            f"SELECT {', '.join(select_cols)} FROM {tmp_table}"
+        ).pl()
+        Y = result_df[f"{y_col}_dm"].to_numpy()
+        X = result_df[[f"{col}_dm" for col in x_cols]].to_numpy()
+        Z = result_df[[f"{col}_dm" for col in instruments]].to_numpy()
+        w = result_df[weights].to_numpy() if weights is not None else None
+        
+        beta, X_hat = iv_2sls(Y, X, Z, w)
+        resid = Y - X_hat @ beta
+        
+        # Compute XtX_inv for IV using Cholesky with fallback
+        if w is not None:
+            sqrt_w = np.sqrt(w)
+            X_for_inv = X_hat * sqrt_w[:, np.newaxis]
+        else:
+            X_for_inv = X_hat
+        
+        try:
+            L = np.linalg.cholesky(X_for_inv.T @ X_for_inv)
+            XtX_inv = np.linalg.solve(
+                L.T,
+                np.linalg.solve(L, np.eye(L.shape[0]))
+            )
+        except np.linalg.LinAlgError:
+            # Fallback to direct inverse if matrix is not SPD
+            XtX_inv = np.linalg.inv(X_for_inv.T @ X_for_inv)
+            
+        df_resid = n_obs - k - absorbed_df
+        
+        # For IV, standard errors are computed in NumPy space using X_hat
+        from leanfe.std_errors import (
+            _compute_se_hc1_iv,
+            _compute_se_cluster_oneway_iv, 
+            _compute_se_cluster_multiway_iv
+        )
+        
+        if vcov == "iid":
+            sigma2 = np.sum((w * resid**2 if w is not None else resid**2)) / df_resid
+            se = np.sqrt(np.maximum(sigma2 * np.diag(XtX_inv), 0.0))
+            n_clusters = None
+            
+        elif vcov == "HC1":
+            se, n_clusters = _compute_se_hc1_iv(
+                XtX_inv=XtX_inv,
+                resid=resid,
+                X=X_hat,
+                weights_array=w,
+                n_obs=n_obs,
+                df_resid=df_resid
+            )
+            
+        elif vcov == "cluster":
+            if cluster_cols is None:
+                raise ValueError("cluster_cols required for vcov='cluster'")
+            
+            if len(cluster_cols) == 1:
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy().flatten()
+            else:
+                cluster_ids = result_df.select(pl.col(cluster_cols)).to_numpy()
+            
+            if len(cluster_cols) == 1:
+                se, n_clusters = _compute_se_cluster_oneway_iv(
+                    XtX_inv=XtX_inv,
+                    resid=resid,
+                    X=X_hat,
+                    weights=w,
+                    cluster_ids=cluster_ids,
+                    n_obs=n_obs,
+                    df_resid=df_resid,
+                    ssc=ssc
+                )
+            else:
+                se, n_clusters = _compute_se_cluster_multiway_iv(
+                    XtX_inv=XtX_inv,
+                    resid=resid,
+                    X=X_hat,
+                    weights=w,
+                    cluster_ids=cluster_ids,
+                    n_obs=n_obs,
+                    df_resid=df_resid,
+                    ssc=ssc
+                )
+        else:
+            raise ValueError(f"Unknown vcov type: {vcov}")
+        
+    else:
+        # OLS: compute X'y and XtX in a single aggregation query
+        agg_exprs = []
+        # X'y
+        for i, col in enumerate(x_cols):
+            agg_exprs.append(f"SUM({col}_dm * {y_col}_dm) AS xty_{i}")
+        # XtX upper triangle only (mirror later)
+        for i, ci in enumerate(x_cols):
+            for j in range(i, k):
+                cj = x_cols[j]
+                agg_exprs.append(f"SUM({ci}_dm * {cj}_dm) AS xtx_{i}_{j}")
+
+        sql = f"SELECT {', '.join(agg_exprs)} FROM {tmp_table}"
+        row = con.execute(sql).fetchone()
+        if row is None:
+            raise ValueError("Failed to compute XtX/X'y in a single query")
+        vals = list(row)
+
+        # Unpack flat result row into X'y and XtX
+        idx = 0
+        Xty = np.zeros(k)
+        for i in range(k):
+            Xty[i] = vals[idx]
+            idx += 1
+
+        XtX = np.zeros((k, k))
+        for i in range(k):
+            for j in range(i, k):
+                XtX[i, j] = XtX[j, i] = vals[idx]
+                idx += 1
+
+        # Use Cholesky decomposition with fallback for both beta and XtX_inv
+        try:
+            L = np.linalg.cholesky(XtX)
+            beta = np.linalg.solve(L.T, np.linalg.solve(L, Xty))
+            XtX_inv = np.linalg.solve(
+                L.T,
+                np.linalg.solve(L, np.eye(L.shape[0]))
+            )
+        except np.linalg.LinAlgError:
+            # Fallback to direct solve/inverse if XtX is not SPD
+            beta = np.linalg.solve(XtX, Xty)
+            XtX_inv = np.linalg.inv(XtX)
+
+        # Compute residuals and store in table for SE computation
+        resid_expr = (
+            f'"{y_col}_dm" - (' +
+            " + ".join(
+                [f"CAST({b} AS DOUBLE) * \"{col}_dm\"" for b, col in zip(beta, x_cols)]
+            ) +
+            ")"
+        )
+        con.execute(
+            f'CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS '
+            f'SELECT *, {resid_expr} AS _resid FROM "{tmp_table}"'
+        )
+        
+        df_resid = n_obs - k - absorbed_df
+        
+        # Compute standard errors using DuckDB-based aggregations
+        se, n_clusters = compute_standard_errors_duckdb(
+            con=con,
+            tmp_table=tmp_table,
+            x_cols=x_cols,
+            XtX_inv=XtX_inv,
+            weights=weights,
+            vcov=vcov,
+            cluster_cols=cluster_cols,
+            n_obs=n_obs,
+            df_resid=df_resid,
+            ssc=ssc
+        )
+    
+    return beta, se, df_resid, n_clusters
+
+
+def leanfe_duckdb(
+    data: str | pl.DataFrame | pl.LazyFrame | None,
+    demean_tol: float,
+    y_col: str | None = None,
+    x_cols: list[str] | None = None,
+    fe_cols: list[str] = [],
+    formula: str | None = None,
+    strategy: str = 'auto',
+    weights: str | None = None,
+    max_iter: int = 25,
+    vcov: Literal["iid", "hc1", "cluster"] = "iid",
+    cluster_cols: list[str] | None = None,
+    ssc: bool = False,
+    sample_frac: float | None = None,
+    con: duckdb.DuckDBPyConnection | None = None
+) -> LeanFEResult:
+    """
+    Fixed effects regression using DuckDB with optimized memory usage.
+
+    Supports formulas without fixed effects (e.g., "y ~ x1 + x2").
+    """
+    assert con is not None, "User must provide a duckdb.connect() object."
+
+    est_comp_ratio = None
+
+    # Create unique prefix for all temp objects for this call
+    uid = uuid.uuid4().hex[:8]
+    def mk_tmp(name: str) -> str:
+        return f"leanfe_{name}_{uid}"
+
+    tmp_table = mk_tmp("data")
+    created_tmp_tables = [tmp_table]
+
+    # Parse formula if provided, otherwise require explicit columns
     if formula is not None:
         y_col, x_cols, fe_cols, factor_vars, interactions, instruments = parse_formula(formula)
     elif y_col is None or x_cols is None or fe_cols is None:
@@ -78,18 +386,15 @@ def leanfe_duckdb(
         factor_vars = []
         interactions = []
         instruments = []
-    
-    # Make lists mutable
+
     x_cols = list(x_cols)
-    fe_cols = list(fe_cols)
-    
-    # Build needed columns
+    fe_cols = list(fe_cols) if fe_cols is not None else []
+
+    # Build minimal set of columns we need to materialize in DuckDB
     needed_cols = [y_col] + x_cols + fe_cols + instruments
-    # Add factor variable columns
     for var, ref in factor_vars:
         if var not in needed_cols:
             needed_cols.append(var)
-    # Add interaction variable columns
     for var, factor, ref in interactions:
         if var not in needed_cols:
             needed_cols.append(var)
@@ -99,286 +404,378 @@ def leanfe_duckdb(
         needed_cols += [c for c in cluster_cols if c not in needed_cols]
     if weights is not None and weights not in needed_cols:
         needed_cols.append(weights)
-    
-    # Setup DuckDB connection
-    con = duckdb.connect()
-    con.execute("SET memory_limit='4GB'")
-    con.execute("SET threads=4")
-    
-    try:
-        # Register data source
-        if isinstance(data, str):
-            col_list = ', '.join(needed_cols)
-            con.execute(f"CREATE VIEW raw_data AS SELECT {col_list} FROM read_parquet('{data}')")
-        else:
-            df = data.select(needed_cols)
-            con.register("raw_data", df.to_arrow())
-        
-        # Sample if requested
+
+    col_list = ', '.join([f'"{c}"' for c in needed_cols])
+
+    # Basic row filter: drop NULLs and (optionally) non-positive weights
+    where_parts = [f'"{col}" IS NOT NULL' for col in needed_cols]
+    if weights is not None:
+        where_parts.append(f'"{weights}" > 0')
+    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+    # If sampling requested, do it in the same CREATE to avoid extra copies
+    if isinstance(data, str):
         if sample_frac is not None:
-            con.execute(f"CREATE TABLE data AS SELECT * FROM raw_data USING SAMPLE {sample_frac * 100}%")
+            pct = sample_frac * 100
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause} USING SAMPLE {pct}%"
+            )
         else:
-            con.execute("CREATE TABLE data AS SELECT * FROM raw_data")
-        
-        # Handle interactions
-        if interactions:
-            for var, factor, ref in interactions:
-                cats = [r[0] for r in con.execute(f"SELECT DISTINCT {factor} FROM data ORDER BY {factor}").fetchall()]
-                # Determine reference category
-                if ref is None:
-                    ref_cat = cats[0]  # Default: first category
-                else:
-                    # Try to match type
-                    ref_cat = ref
-                    if cats and not isinstance(cats[0], str):
-                        try:
-                            ref_cat = type(cats[0])(ref)
-                        except (ValueError, TypeError):
-                            pass
-                    if ref_cat not in cats:
-                        raise ValueError(f"Reference category '{ref}' not found in {factor}. Available: {cats}")
-                
-                for cat in cats:
-                    if cat == ref_cat:
-                        continue  # Skip reference category
-                    col_name = f"{var}_{cat}"
-                    con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                    con.execute(f"UPDATE data SET {col_name} = CASE WHEN {factor} = '{cat}' THEN {var} ELSE 0 END")
-                    x_cols.append(col_name)
-        
-        # Handle factor variables
-        if factor_vars:
-            for var, ref in factor_vars:
-                cats = [r[0] for r in con.execute(f"SELECT DISTINCT {var} FROM data ORDER BY {var}").fetchall()]
-                # Determine reference category
-                if ref is None:
-                    ref_cat = cats[0]  # Default: first category
-                else:
-                    # Try to match type
-                    ref_cat = ref
-                    if cats and not isinstance(cats[0], str):
-                        try:
-                            ref_cat = type(cats[0])(ref)
-                        except (ValueError, TypeError):
-                            pass
-                    if ref_cat not in cats:
-                        raise ValueError(f"Reference category '{ref}' not found in {var}. Available: {cats}")
-                
-                for cat in cats:
-                    if cat == ref_cat:
-                        continue  # Skip reference category
-                    col_name = f"{var}_{cat}"
-                    con.execute(f"ALTER TABLE data ADD COLUMN {col_name} DOUBLE")
-                    con.execute(f"UPDATE data SET {col_name} = CASE WHEN {var} = '{cat}' THEN 1 ELSE 0 END")
-                    x_cols.append(col_name)
-        
-        # Check if we should use compression strategy (faster for IID/HC1 without IV)
-        # But only if FEs are low-cardinality (otherwise FWL demeaning is faster)
-        is_iv = len(instruments) > 0
-        
-        # Compute FE cardinality to decide strategy
-        fe_cardinality = {}
-        for fe in fe_cols:
-            card = con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0]
-            fe_cardinality[fe] = card
-        n_obs_initial = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
-        use_compress = should_use_compress(
-            vcov, is_iv, fe_cardinality,
-            max_fe_levels=10000,
-            n_obs=n_obs_initial,
-            n_x_cols=len(x_cols)
+            sql = (
+                f"CREATE TEMPORARY TABLE \"{tmp_table}\" AS "
+                f"SELECT {col_list} FROM read_parquet('{data}') "
+                f"{where_clause}"
+            )
+        con.execute(sql)
+
+    elif isinstance(data, pl.DataFrame):
+        # Register in-memory DataFrame as a DuckDB table
+        src_name = mk_tmp("src")
+        con.register(src_name, data.select(needed_cols))
+        con.execute(
+            f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"'
         )
-        
-        if use_compress:
-            # Use YOCO compression strategy - much faster and lower memory
-            # For cluster SEs, use first cluster column (Section 5.3.1 of YOCO paper)
-            cluster_col = cluster_cols[0] if vcov == "cluster" and cluster_cols else None
-            result = leanfe_compress_duckdb(
-                con=con,
-                y_col=y_col,
-                x_cols=x_cols,
-                fe_cols=fe_cols,
-                weights=weights,
-                vcov=vcov,
-                cluster_col=cluster_col,
-                ssc=ssc
-            )
-            # Add missing fields for compatibility
-            result["iterations"] = 0
-            result["is_iv"] = False
-            result["n_instruments"] = None
-            result["formula"] = formula
-            result["fe_cols"] = fe_cols
-            return result
-        
-        # Fall back to FWL demeaning for cluster SEs or IV
-        # Drop singletons
+        created_tmp_tables.append(src_name)
+
+    elif isinstance(data, pl.LazyFrame):
+        # Collect just the needed columns before registering
+        df = data.select(needed_cols).collect()
+        src_name = mk_tmp("src")
+        con.register(src_name, df)
+        con.execute(
+            f'CREATE TEMPORARY TABLE "{tmp_table}" AS SELECT * FROM "{src_name}"'
+        )
+        created_tmp_tables.append(src_name)
+    else:
+        raise ValueError('Please specify either data or con argument')
+
+    # Handle interaction terms from formula (expands X)
+    if interactions:
+        new_cols = _expand_interactions_duckdb(
+            con=con,
+            table_name=tmp_table,
+            interactions=interactions
+        )
+        x_cols = x_cols + new_cols
+
+    # Handle factor variables from formula (expands X)
+    if factor_vars:
+        new_cols = _expand_factors_duckdb(
+            con=con,
+            table_name=tmp_table,
+            factor_vars=factor_vars
+        )
+        x_cols = x_cols + new_cols
+
+    is_iv = len(instruments) > 0
+
+    if fe_cols:
+        # Compute FE cardinality once; used for strategy and ordering
+        fe_cardinality: dict[str, int] = {}
         for fe in fe_cols:
-            con.execute(f"DELETE FROM data WHERE {fe} IN (SELECT {fe} FROM data GROUP BY {fe} HAVING COUNT(*) = 1)")
-        
-        n_obs = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
-        cols_to_demean = [y_col] + x_cols + instruments
-        
-        # Order FEs by cardinality (low-card first) for faster convergence
-        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
-        
-        # Add demeaned columns
-        for col in cols_to_demean:
-            con.execute(f"ALTER TABLE data ADD COLUMN {col}_dm DOUBLE")
-            con.execute(f"UPDATE data SET {col}_dm = {col}")
-        
-        dm_cols = [f"{col}_dm" for col in cols_to_demean]
-        
-        # Iterative demeaning
-        for it in range(1, max_iter + 1):
-            for fe in fe_cols_ordered:
-                if weights is not None:
-                    for col in dm_cols:
-                        con.execute(f"""
-                            UPDATE data SET {col} = {col} - (
-                                SELECT SUM(d2.{col} * d2.{weights}) / SUM(d2.{weights})
-                                FROM data d2 WHERE d2.{fe} = data.{fe}
-                            )
-                        """)
-                else:
-                    for col in dm_cols:
-                        con.execute(f"""
-                            WITH fe_means AS (SELECT {fe}, AVG({col}) as mean_val FROM data GROUP BY {fe})
-                            UPDATE data SET {col} = data.{col} - fe_means.mean_val
-                            FROM fe_means WHERE data.{fe} = fe_means.{fe}
-                        """)
-            
-            if it >= 3:
-                max_mean = 0
-                for fe in fe_cols:
-                    for col in dm_cols:
-                        result = con.execute(f"SELECT MAX(ABS(avg_val)) FROM (SELECT AVG({col}) as avg_val FROM data GROUP BY {fe})").fetchone()[0]
-                        max_mean = max(max_mean, abs(result or 0))
-                if max_mean < demean_tol:
-                    break
-        
-        k = len(x_cols)
-        is_iv = len(instruments) > 0
-        
-        if is_iv:
-            # Extract data for IV
-            select_cols = [f"{col}_dm" for col in [y_col] + x_cols + instruments]
-            if weights is not None:
-                select_cols.append(weights)
-            if cluster_cols is not None:
-                select_cols.extend(cluster_cols)
-            
-            result_df = con.execute(f"SELECT {', '.join(select_cols)} FROM data").fetchdf()
-            Y = result_df[f"{y_col}_dm"].values
-            X = result_df[[f"{col}_dm" for col in x_cols]].values
-            Z = result_df[[f"{col}_dm" for col in instruments]].values
-            w = result_df[weights].values if weights is not None else None
-            
-            beta, X_hat = iv_2sls(Y, X, Z, w)
-            resid = Y - X_hat @ beta
-        else:
-            # OLS via SQL aggregates
-            XtX = np.zeros((k, k))
-            Xty = np.zeros(k)
-            
-            for i, col_i in enumerate(x_cols):
-                col_i_dm = f"{col_i}_dm"
-                Xty[i] = con.execute(f"SELECT SUM({col_i_dm} * {y_col}_dm) FROM data").fetchone()[0]
-                for j in range(i, k):
-                    col_j_dm = f"{x_cols[j]}_dm"
-                    val = con.execute(f"SELECT SUM({col_i_dm} * {col_j_dm}) FROM data").fetchone()[0]
-                    XtX[i, j] = val
-                    XtX[j, i] = val
-            
-            beta = np.linalg.solve(XtX, Xty)
-            
-            resid_expr = f"{y_col}_dm - (" + " + ".join([f"{b} * {col}_dm" for b, col in zip(beta, x_cols)]) + ")"
-            con.execute("ALTER TABLE data ADD COLUMN _resid DOUBLE")
-            con.execute(f"UPDATE data SET _resid = {resid_expr}")
-        
-        # Degrees of freedom
-        n_fe_groups = sum(con.execute(f"SELECT COUNT(DISTINCT {fe}) FROM data").fetchone()[0] for fe in fe_cols)
-        absorbed_df = n_fe_groups - len(fe_cols)
-        df_resid = n_obs - k - absorbed_df
-        
-        # Compute XtX_inv
-        if is_iv:
-            if w is not None:
-                sqrt_w = np.sqrt(w)
-                X_hat_w = X_hat * sqrt_w[:, np.newaxis]
-                XtX_inv = np.linalg.inv(X_hat_w.T @ X_hat_w)
+            card_query = f"SELECT COUNT(DISTINCT {fe}) FROM {tmp_table}"
+            card = con.execute(card_query).fetchone()
+            if card is None:
+                raise ValueError(
+                    f'Error in computing FE ({fe}) cardinality, '
+                    f'check dtype of {fe} or try different backend'
+                )
+            card = int(card[0])
+            fe_cardinality[fe] = card
+    else:
+        fe_cardinality = {}
+
+    n_obs_initial_query = f"SELECT COUNT(*) FROM {tmp_table}"
+    n_obs_initial = con.execute(n_obs_initial_query).fetchone()
+    if n_obs_initial is None:
+        raise ValueError('Could not fetch number of obs/rows. Check for corrupted data')
+    n_obs_initial = int(n_obs_initial[0])
+
+    # Auto-select strategy if requested
+    if strategy == 'auto':
+        est_comp_ratio = estimate_compression_ratio(
+            con=con,
+            table_ref=f'{tmp_table}',
+            x_cols=x_cols,
+            fe_cols=fe_cols
+        )
+
+        if not fe_cols:
+            # No FE: decide between OLS and compress based on compression ratio
+            if est_comp_ratio >= 0.8:
+                inferred_strategy = 'ols'
             else:
-                XtX_inv = np.linalg.inv(X_hat.T @ X_hat)
+                inferred_strategy = 'compress'
+
+        elif len(fe_cols) == 1:
+            inferred_strategy = 'demean'
         else:
-            XtX_inv = np.linalg.inv(XtX)
-        
-        # Standard errors
-        if is_iv:
-            cluster_ids = None
-            if vcov == "cluster":
-                if cluster_cols is None:
-                    raise ValueError("cluster_cols required for vcov='cluster'")
-                if len(cluster_cols) == 1:
-                    cluster_ids = result_df[cluster_cols[0]].values
-                else:
-                    cluster_ids = result_df[cluster_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1).values
-            
-            se, n_clusters = compute_standard_errors(
-                XtX_inv=XtX_inv, resid=resid, n_obs=n_obs, df_resid=df_resid,
-                vcov=vcov, X=X_hat, weights=w, cluster_ids=cluster_ids, ssc=ssc
+            inferred_strategy = determine_strategy(
+                vcov,
+                is_iv,
+                fe_cardinality,
+                max_fe_levels=MAX_FE_LEVELS,
+                n_obs=n_obs_initial,
+                n_x_cols=len(x_cols),
+                estimated_compression_ratio=est_comp_ratio
             )
+
+        print(
+            f'Auto selection: Inferring {inferred_strategy} strategy. '
+            f'N = {n_obs_initial:_}, est. compression ratio: {est_comp_ratio}'
+        )
+        strategy = inferred_strategy
+
+    if strategy == 'compress':
+        # Use YOCO-style compression path (preferred when it fits)
+        print('Using compression strategy...')
+        result = leanfe_compress_duckdb(
+            con=con,
+            y_col=y_col,
+            x_cols=x_cols,
+            fe_cols=fe_cols,
+            table_ref=tmp_table,
+            weights=weights,
+            vcov=vcov,
+            cluster_col=cluster_cols,
+            ssc=ssc
+        )
+        result.formula = formula
+        result.fe_cols = fe_cols
+        _safe_cleanup(con, uid)
+        return result
+
+    if strategy == 'alt_proj':
+        if not fe_cols:
+            raise ValueError("Strategy 'alt_proj' requires FE-cols.")
+        
+        print('Using FWL/alternating projections strategy...')
+
+        # 1. Drop NULLs and singleton FE levels 
+        if fe_cols:
+            # Drop rows with NULL in any FE
+            null_filter = " OR ".join([f'"{fe}" IS NULL' for fe in fe_cols])
+            con.execute(f'DELETE FROM "{tmp_table}" WHERE {null_filter}')
+            
+            # Drop singleton FE levels for each FE
+            singleton_conditions = []
+            for fe in fe_cols:
+                singleton_conditions.append(
+                    f'"{fe}" IN ('
+                    f'SELECT "{fe}" FROM "{tmp_table}" '
+                    f'GROUP BY 1 HAVING COUNT(*) = 1'
+                    f')'
+                )
+            if singleton_conditions:
+                con.execute(
+                    f'DELETE FROM "{tmp_table}" WHERE ' +
+                    " OR ".join(singleton_conditions)
+                )
+
+        n_obs_res = con.execute(
+            f'SELECT COUNT(*) FROM "{tmp_table}"'
+        ).fetchone()
+        if n_obs_res is None:
+            raise ValueError('Could not fetch number of rows (n_obs)')
+        n_obs = int(n_obs_res[0])
+
+        # 2. Setup working table: keep FE/cluster/weights + demeaned copies
+        cols_to_demean = [y_col] + x_cols + instruments
+        dm_cols = [f"{col}_dm" for col in cols_to_demean]
+
+        # static columns are: FEs, cluster cols, weights
+        cols_static = list(dict.fromkeys(
+            fe_cols +
+            (cluster_cols if cluster_cols else []) +
+            ([weights] if weights else [])
+        ))
+        static_col_str = ", ".join(f'"{c}"' for c in cols_static) if cols_static else ""
+
+        # Original values become _dm columns
+        select_dm = ", ".join(
+            f'"{col}" AS "{col}_dm"' for col in cols_to_demean
+        )
+
+        work_table = mk_tmp("work")
+
+        if cols_static:
+            con.execute(f"""
+                CREATE TEMPORARY TABLE "{work_table}" AS 
+                SELECT {static_col_str}, {select_dm}
+                FROM "{tmp_table}"
+            """)
         else:
-            n_clusters = None
-            if vcov == "iid":
-                if weights is not None:
-                    sigma2 = con.execute(f"SELECT SUM({weights} * _resid * _resid) / {df_resid} FROM data").fetchone()[0]
-                else:
-                    sigma2 = con.execute(f"SELECT SUM(_resid * _resid) / {df_resid} FROM data").fetchone()[0]
-                se = np.sqrt(sigma2 * np.diag(XtX_inv))
-            elif vcov == "HC1":
-                meat = np.zeros((k, k))
-                for i, col_i in enumerate(x_cols):
-                    for j in range(i, k):
-                        col_j = x_cols[j]
-                        if weights is not None:
-                            val = con.execute(f"SELECT SUM({weights} * {col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
-                        else:
-                            val = con.execute(f"SELECT SUM({col_i}_dm * {col_j}_dm * _resid * _resid) FROM data").fetchone()[0]
-                        meat[i, j] = val
-                        meat[j, i] = val
-                vcov_matrix = XtX_inv @ meat @ XtX_inv
-                se = np.sqrt((n_obs / df_resid) * np.diag(vcov_matrix))
-            elif vcov == "cluster":
-                if cluster_cols is None:
-                    raise ValueError("cluster_cols required for vcov='cluster'")
-                cluster_expr = cluster_cols[0] if len(cluster_cols) == 1 else f"CONCAT_WS('_', {', '.join(cluster_cols)})"
-                if weights is not None:
-                    score_exprs = [f"SUM({col}_dm * _resid * {weights}) AS score_{i}" for i, col in enumerate(x_cols)]
-                else:
-                    score_exprs = [f"SUM({col}_dm * _resid) AS score_{i}" for i, col in enumerate(x_cols)]
-                cluster_scores = con.execute(f"SELECT {cluster_expr} AS cluster_id, {', '.join(score_exprs)} FROM data GROUP BY {cluster_expr}").fetchdf()
-                n_clusters = len(cluster_scores)
-                S = cluster_scores[[f"score_{i}" for i in range(k)]].values
-                meat = S.T @ S
-                adj = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / df_resid) if ssc else n_clusters / (n_clusters - 1)
-                vcov_matrix = adj * XtX_inv @ meat @ XtX_inv
-                se = np.sqrt(np.diag(vcov_matrix))
-            else:
-                raise ValueError(f"Unknown vcov: {vcov}")
-    finally:
-        con.close()
+            con.execute(f"""
+                CREATE TEMPORARY TABLE "{work_table}" AS 
+                SELECT {select_dm}
+                FROM "{tmp_table}"
+            """)
+
+        tmp_table = work_table  # from here on, AP operates on work_table
+
+        # 3. Order FEs by cardinality
+        fe_cols_ordered = sorted(fe_cols, key=lambda fe: fe_cardinality.get(fe, 0))
+
+        # 4. Build common pieces used in the AP loop
+
+        # Aggregation expressions: sums over *_dm, and inv_weight
+        if weights:
+            def fe_sums_sql(fe: str) -> str:
+                sums = ", ".join(
+                    f'SUM(d."{c}" * d."{weights}") AS "{c}_sum"' for c in dm_cols
+                )
+                return f"""
+                    SELECT
+                        d."{fe}",
+                        {sums},
+                        1.0 / SUM(d."{weights}") AS inv_weight
+                    FROM "{tmp_table}" d
+                    GROUP BY 1
+                """
+        else:
+            def fe_sums_sql(fe: str) -> str:
+                sums = ", ".join(
+                    f'SUM(d."{c}") AS "{c}_sum"' for c in dm_cols
+                )
+                return f"""
+                    SELECT
+                        d."{fe}",
+                        {sums},
+                        1.0 / COUNT(*) AS inv_weight
+                    FROM "{tmp_table}" d
+                    GROUP BY 1
+                """
+
+        # Convergence check expression: max absolute mean adjustment across dm cols
+        def conv_expr() -> str:
+            terms = ", ".join(
+                f'ABS("{c}_sum" * inv_weight)' for c in dm_cols
+            )
+            return f"GREATEST({terms})"
+
+        it = 0
+
+        for it in range(1, max_iter + 1):
+            max_err = 0.0
+
+            for fe in fe_cols_ordered:
+                # A. Compute FE sums + inv_weight
+                sums_sql = fe_sums_sql(fe)
+                con.execute(f'CREATE OR REPLACE TEMPORARY TABLE fe_sums AS {sums_sql}')
+
+                # B. Convergence metric for this FE
+                conv_sql = f"""
+                    SELECT MAX({conv_expr()}) AS max_err
+                    FROM fe_sums
+                """
+                cur = con.execute(conv_sql).fetchone()
+                if cur is not None and cur[0] is not None:
+                    cur_err = float(cur[0])
+                    max_err = max(max_err, cur_err)
+
+                # C. Subtract FE means: overwrite tmp_table in place
+                #    d.<col>_dm - fs.<col>_dm_sum * inv_weight  for all dm_cols
+                keep_static = ", ".join(f'd."{c}"' for c in cols_static) if cols_static else ""
+                if keep_static:
+                    keep_static += ", "
+
+                subtract_exprs = ", ".join(
+                    f'd."{col}_dm" - fs."{col}_dm_sum" * fs.inv_weight AS "{col}_dm"'
+                    for col in cols_to_demean
+                )
+
+                sql_update = f"""
+                    CREATE OR REPLACE TEMPORARY TABLE "{tmp_table}" AS
+                    SELECT
+                        {keep_static}{subtract_exprs}
+                    FROM "{tmp_table}" d
+                    JOIN fe_sums fs
+                    ON d."{fe}" = fs."{fe}";
+                """
+                con.execute(sql_update)
+
+                # We keep reusing the same fe_sums name with OR REPLACE,
+                # so no need to DROP fe_sums explicitly each time.
+
+            if max_err < demean_tol:
+                break
+
+        # 5. Absorbed degrees of freedom (approximate within-FE DF)
+        total_fe_levels = 0
+        fe_dims: tuple[int, ...] = ()
+        for fe in fe_cols:
+            n_u = con.execute(
+                f'SELECT COUNT(DISTINCT "{fe}") FROM "{tmp_table}"'
+            ).fetchone()
+            if n_u is None:
+                raise ValueError('Could not fetch FE dimension')
+            n_u = int(n_u[0])
+            fe_dims = fe_dims + (n_u,)
+            total_fe_levels += n_u
+        absorbed_df = total_fe_levels - (len(fe_cols) - 1)
+        # Clean up
+        con.execute("DROP TABLE IF EXISTS fe_sums")
     
-    return build_result(
+
+    # Handle OLS case (no FE demeaning required)
+    elif strategy == 'ols':
+        print('Using simple OLS strategy (no fixed effects)...')
+        it = 0
+        absorbed_df = 0
+        fe_dims = None
+        n_obs = n_obs_initial
+        
+        # Create working table with _dm columns (copy originals)
+        cols_to_demean = [y_col] + x_cols + instruments
+        cols_to_keep = cols_to_demean
+        if cluster_cols is not None:
+            cols_to_keep += cluster_cols
+        if weights is not None and weights not in cols_to_keep:
+            cols_to_keep.append(weights)
+        
+        work_table = mk_tmp("work")
+        select_dm = ", ".join([f"{col} AS {col}_dm" for col in cols_to_demean])
+        all_cols = ", ".join([f'"{c}"' for c in cols_to_keep])
+        con.execute(
+            f'CREATE OR REPLACE TEMP TABLE "{work_table}" AS '
+            f'SELECT {all_cols}, {select_dm} FROM "{tmp_table}"'
+        )
+        tmp_table = work_table
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    # Run regression (common for both OLS and alt_proj branches)
+    beta, se, df_resid, n_clusters = _run_regression_duckdb(
+        con=con,
+        tmp_table=tmp_table,
+        y_col=y_col,
         x_cols=x_cols,
-        beta=beta,
-        se=se,
+        instruments=instruments,
+        weights=weights,
+        vcov=vcov,
+        cluster_cols=cluster_cols,
+        ssc=ssc,
+        n_obs=n_obs,
+        absorbed_df=absorbed_df
+    )
+
+    _safe_cleanup(con, uid)
+
+    return LeanFEResult(
+        coefs=dict(zip(x_cols, beta)),
+        std_errors=dict(zip(x_cols, se)),
         n_obs=n_obs,
         iterations=it,
-        vcov=vcov,
-        is_iv=is_iv,
-        n_instruments=len(instruments) if is_iv else None,
+        vcov_type=vcov,
+        is_iv=len(instruments) > 0,
+        n_instruments=len(instruments) if instruments else None,
         n_clusters=n_clusters,
         df_resid=df_resid,
         formula=formula,
-        fe_cols=fe_cols
+        fe_cols=fe_cols,
+        fe_dims=fe_dims,
+        compression_ratio=est_comp_ratio
     )

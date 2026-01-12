@@ -1,0 +1,54 @@
+```{r}
+install.packages(
+   "dbreg",
+   repos = c("https://grantmcdermott.r-universe.dev", getOption("repos"))
+)
+```
+
+```{r}
+library(fixest)
+library(dbreg)
+library(duckdb)
+library(glue)
+library(DBI)
+library(arrow)
+library(data.table)
+path = '/home/jbh/projects/leanfe/python/tests/data/data_fe.pq'
+df = as.data.table(read_parquet(path))
+```
+
+```{r}
+result = feols(log_wage ~ age + age_sq | firm_id, 
+               data = df,
+               vcov = ~firm_id + worker_id)
+
+# Check these attributes
+summary(result)
+attributes(vcov(result, attr = TRUE))
+result$nparams
+result$nobs
+```
+```{r}
+
+```
+
+
+```{r}
+con = dbConnect(duckdb())
+data_path = 'data/data_low_dim'
+
+dbExecute(con, 
+          glue("CREATE VIEW panel_data AS 
+                SELECT * FROM read_parquet('{data_path}.pq')"))
+```
+
+
+```{r}
+dbreg(
+  log_wage ~ age + age_sq | firm_id,
+  con = con,
+  table = 'panel_data'
+)
+
+```
+

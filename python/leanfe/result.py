@@ -5,9 +5,8 @@ Provides a nice formatted table output similar to fixest/statsmodels.
 """
 
 import numpy as np
-from typing import Dict, List, Optional
 from scipy import stats
-
+from typing import Any
 
 class LeanFEResult:
     """
@@ -17,7 +16,7 @@ class LeanFEResult:
     
     Attributes
     ----------
-    coefficients : dict
+    coefs : dict
         Coefficient estimates by variable name
     std_errors : dict
         Standard errors by variable name
@@ -35,8 +34,14 @@ class LeanFEResult:
         Whether IV/2SLS was used
     n_instruments : int or None
         Number of instruments (if IV)
-    n_clusters : int or None
+    n_clusters : int or tuple or None
         Number of clusters (if clustered SEs)
+        For multi-way clustering, tuple with count for each dimension
+    fe_cols : list or dict or None
+        Fixed effect column names
+    fe_dims : tuple or None
+        Fixed effect dimensions (n_unique for each FE)
+        Example: (50, 100) means 50 groups in first FE, 100 in second FE
     df_resid : int
         Residual degrees of freedom
     r_squared : float or None
@@ -45,44 +50,50 @@ class LeanFEResult:
     
     def __init__(
         self,
-        coefficients: Dict[str, float],
-        std_errors: Dict[str, float],
+        coefs: dict[str, float],
+        std_errors: dict[str, float],
         n_obs: int,
-        iterations: int,
-        vcov_type: str,
-        is_iv: bool,
-        n_instruments: Optional[int],
-        n_clusters: Optional[int],
-        df_resid: Optional[int] = None,
-        r_squared: Optional[float] = None,
-        r_squared_within: Optional[float] = None,
-        rss: Optional[float] = None,
-        tss: Optional[float] = None,
-        formula: Optional[str] = None,
-        fe_cols: Optional[List[str]] = None
+        vcov_type: str,           
+        iterations: int = 0,
+        n_compressed: int | None = None,
+        compression_ratio: float | None = None,       
+        is_iv: bool = False,       
+        n_instruments: int | None = None,
+        n_clusters: int | tuple[int, ...] | None = None,
+        df_resid: int | None = None,
+        r_squared: float | None = None,
+        r_squared_within: float | None = None,
+        rss: float | None = None,
+        tss: float | None = None,
+        formula: str | None = None,
+        fe_cols: list[str] | dict[str, Any] | None = None,
+        fe_dims: tuple[int, ...] | None = None
     ):
-        self.coefficients = coefficients
+        self.coefs = coefs
         self.std_errors = std_errors
         self.n_obs = n_obs
         self.iterations = iterations
+        self.n_compressed  = n_compressed
+        self.compression_ratio = compression_ratio
         self.vcov_type = vcov_type
         self.is_iv = is_iv
         self.n_instruments = n_instruments
         self.n_clusters = n_clusters
-        self.df_resid = df_resid or (n_obs - len(coefficients))
+        self.df_resid = df_resid or (n_obs - len(coefs))
         self.r_squared = r_squared
         self.r_squared_within = r_squared_within
         self.rss = rss
         self.tss = tss
         self.formula = formula
         self.fe_cols = fe_cols or []
+        self.fe_dims = fe_dims
         
         # Compute t-stats and p-values
         self.t_stats = {}
         self.p_values = {}
-        for var in coefficients:
+        for var in coefs:
             if std_errors[var] > 0:
-                t = coefficients[var] / std_errors[var]
+                t = coefs[var] / std_errors[var]
                 self.t_stats[var] = t
                 # Two-tailed p-value
                 self.p_values[var] = 2 * (1 - stats.t.cdf(abs(t), self.df_resid))
@@ -108,9 +119,8 @@ class LeanFEResult:
     
     def __repr__(self) -> str:
         """Short representation."""
-        n_coef = len(self.coefficients)
-        return f"LeanFEResult(n_obs={self.n_obs:,}, n_coef={n_coef}, vcov='{self.vcov_type}')"
-    
+        n_coef = len(self.coefs)
+        return f"LeanFEResult(n_obs={self.n_obs:_}, n_coef={n_coef}, vcov='{self.vcov_type}')"    
     def __str__(self) -> str:
         """Formatted regression table output."""
         lines = []
@@ -124,14 +134,29 @@ class LeanFEResult:
         # Model info
         if self.formula:
             lines.append(f"Formula:      {self.formula}")
-        lines.append(f"Observations: {self.n_obs:,}")
+            lines.append(f"Observations: {self.n_obs:_}")
+        
+        # Fixed effects information
         if self.fe_cols:
-            lines.append(f"Fixed Effects: {', '.join(self.fe_cols)}")
+            if isinstance(self.fe_cols, list) and self.fe_cols:
+                lines.append(f"Fixed Effects: {', '.join(self.fe_cols)}")
+                # Display dimensionality if available
+                if self.fe_dims:
+                    fe_dims_str = ' × '.join([f"{d:_}" for d in self.fe_dims])
+                    lines.append(f"FE Dimensions: {fe_dims_str}")
+            elif isinstance(self.fe_cols, dict):
+                for fe, count in self.fe_cols.items():
+                    lines.append(f"Fixed Effect ({fe}): {count:_} groups")
+        
         if self.r_squared_within is not None:
             lines.append(f"R² (within):  {self.r_squared_within:.4f}")
         lines.append(f"Std. Errors:  {self._vcov_description()}")
         if self.n_clusters:
-            lines.append(f"Clusters:     {self.n_clusters:,}")
+            if isinstance(self.n_clusters, tuple):
+                cluster_str = ' × '.join([f"{c:_}" for c in self.n_clusters])
+                lines.append(f"Clusters:     {cluster_str}")
+            else:
+                lines.append(f"Clusters:     {self.n_clusters:_}")
         
         lines.append("-" * 70)
         
@@ -139,9 +164,9 @@ class LeanFEResult:
         lines.append(f"{'Variable':<20} {'Estimate':>12} {'Std.Err':>12} {'t-stat':>10} {'p-value':>10}")
         lines.append("-" * 70)
         
-        # Coefficients
-        for var in self.coefficients:
-            coef = self.coefficients[var]
+        # coefs
+        for var in self.coefs:
+            coef = self.coefs[var]
             se = self.std_errors[var]
             t = self.t_stats[var]
             p = self.p_values[var]
@@ -171,31 +196,31 @@ class LeanFEResult:
             return f"Clustered ({self.n_clusters:,} clusters)"
         return self.vcov_type
     
-    def coef(self, var: Optional[str] = None):
+    def coef(self, var: str | None = None):
         """Get coefficient(s). If var is None, returns all as dict."""
         if var is None:
-            return self.coefficients.copy()
-        return self.coefficients.get(var)
+            return self.coefs.copy()
+        return self.coefs.get(var)
     
-    def se(self, var: Optional[str] = None):
+    def se(self, var: str | None = None):
         """Get standard error(s). If var is None, returns all as dict."""
         if var is None:
             return self.std_errors.copy()
         return self.std_errors.get(var)
     
-    def tstat(self, var: Optional[str] = None):
+    def tstat(self, var: str | None = None):
         """Get t-statistic(s). If var is None, returns all as dict."""
         if var is None:
             return self.t_stats.copy()
         return self.t_stats.get(var)
     
-    def pvalue(self, var: Optional[str] = None):
+    def pvalue(self, var: str | None = None):
         """Get p-value(s). If var is None, returns all as dict."""
         if var is None:
             return self.p_values.copy()
         return self.p_values.get(var)
     
-    def confint(self, level: float = 0.95) -> Dict[str, tuple]:
+    def confint(self, level: float = 0.95) -> dict[str, tuple]:
         """
         Compute confidence intervals.
         
@@ -213,29 +238,34 @@ class LeanFEResult:
         t_crit = stats.t.ppf(1 - alpha/2, self.df_resid)
         
         ci = {}
-        for var in self.coefficients:
-            coef = self.coefficients[var]
+        for var in self.coefs:
+            coef = self.coefs[var]
             se = self.std_errors[var]
             ci[var] = (coef - t_crit * se, coef + t_crit * se)
         return ci
-    
+
+
     def to_dict(self) -> dict:
-        """Convert to dictionary (for backwards compatibility)."""
+        """Convert to dictionary with visual underscores for integers."""
         return {
-            'coefficients': self.coefficients,
+            'formula': self.formula,
+            'coefs': self.coefs,
             'std_errors': self.std_errors,
             't_stats': self.t_stats,
             'p_values': self.p_values,
-            'n_obs': self.n_obs,
+            'n_obs': wrap_int(self.n_obs),
+            'n_compressed': wrap_int(self.n_compressed),
+            'compression_ratio': self.compression_ratio,
+            'fe_cols': self.fe_cols,
+            'fe_dims': self.fe_dims,
             'iterations': self.iterations,
             'vcov_type': self.vcov_type,
             'is_iv': self.is_iv,
             'n_instruments': self.n_instruments,
             'n_clusters': self.n_clusters,
-            'df_resid': self.df_resid,
+            'df_resid': wrap_int(self.df_resid),
             'r_squared_within': self.r_squared_within
-        }
-    
+    }
     # Allow dict-like access for backwards compatibility
     def __getitem__(self, key):
         return self.to_dict()[key]
@@ -255,3 +285,12 @@ class LeanFEResult:
     
     def items(self):
         return self.to_dict().items()
+
+class PrettyInt(int):
+    """An integer that displays with underscores in its representation."""
+    def __repr__(self) -> str:
+        return f"{self:_}"
+
+def wrap_int(val: Any) -> PrettyInt | None:
+    """Safely wraps an integer for display, returning None if the input is None."""
+    return PrettyInt(val) if val is not None else None

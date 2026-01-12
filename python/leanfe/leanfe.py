@@ -3,29 +3,31 @@ Fast high-dimensional fixed effects regression.
 
 Main entry point for the package with support for Polars and DuckDB backends.
 """
-
-from typing import List, Optional, Union, Literal
+from leanfe.result import LeanFEResult
+from typing import Literal
 import polars as pl
-
-from .polars_impl import leanfe_polars
-from .duckdb_impl import leanfe_duckdb
+from duckdb import DuckDBPyConnection
+from leanfe.polars_impl import leanfe_polars
+from leanfe.duckdb_impl import leanfe_duckdb
 
 
 def leanfe(
-    data: Union[str, pl.DataFrame],
-    y_col: Optional[str] = None,
-    x_cols: Optional[List[str]] = None,
-    fe_cols: Optional[List[str]] = None,
-    formula: Optional[str] = None,
-    weights: Optional[str] = None,
-    demean_tol: float = 1e-5,
-    max_iter: int = 500,
-    vcov: str = "iid",
-    cluster_cols: Optional[List[str]] = None,
-    ssc: bool = False,
-    sample_frac: Optional[float] = None,
-    backend: Literal["polars", "duckdb"] = "polars"
-) -> dict:
+    data: str | pl.DataFrame | pl.LazyFrame | None = None,
+    y_col: str | None = None,
+    x_cols: list[str] | None = None,
+    fe_cols: list[str]  = [],
+    formula: str | None = None,
+    strategy: Literal['auto', 'compress', 'alt_proj', 'demean'] = 'auto',
+    weights: str | None = None,
+    demean_tol: float = 1e-6,
+    max_iter: int = 50,
+    vcov: Literal['iid', 'hc1', 'cluster'] = "iid",
+    cluster_cols: list[str] | None = None,
+    ssc: bool = True,
+    sample_frac: float | None = None,
+    backend: Literal["polars", "duckdb"] = "polars",
+    con: DuckDBPyConnection | None = None
+) -> LeanFEResult:
     """
     Fast fixed effects regression using Polars or DuckDB backend.
     
@@ -72,7 +74,7 @@ def leanfe(
     -------
     dict
         Dictionary containing:
-        - coefficients: dict mapping variable names to coefficient estimates
+        - coefs: dict mapping variable names to coefficient estimates
         - std_errors: dict mapping variable names to standard errors
         - n_obs: number of observations used
         - iterations: number of demeaning iterations
@@ -105,7 +107,7 @@ def leanfe(
     
     >>> from leanfe import leanfe
     >>> result = leanfe(df, formula="y ~ treatment | customer + product")
-    >>> print(result['coefficients']['treatment'])
+    >>> print(result['coefs']['treatment'])
     
     With clustered standard errors:
     
@@ -134,34 +136,49 @@ def leanfe(
     ... )
     """
     if backend == "polars":
+        con = None
+        if data is None:
+            raise ValueError(
+                f'A dataset must be provided when using backend = {backend}.\n'
+                "Example: leanfe(data = pl.scan_parquet('data.pq').collect(), backend='polars')"
+            )
         return leanfe_polars(
-            data=data,
-            y_col=y_col,
-            x_cols=x_cols,
-            fe_cols=fe_cols,
-            formula=formula,
-            weights=weights,
-            demean_tol=demean_tol,
-            max_iter=max_iter,
-            vcov=vcov,
-            cluster_cols=cluster_cols,
-            ssc=ssc,
-            sample_frac=sample_frac
+            data = data,
+            y_col = y_col,
+            x_cols = x_cols,
+            fe_cols = fe_cols,
+            formula = formula,
+            strategy = strategy,
+            weights = weights,
+            demean_tol = demean_tol,
+            max_iter = max_iter,
+            vcov = vcov,
+            cluster_cols = cluster_cols,
+            ssc = ssc,
+            sample_frac = sample_frac
         )
     elif backend == "duckdb":
+        if con is None:
+            raise ValueError(
+                f'A DuckDBPyConnection must be provided when using backend = {backend}.\n'
+                "Example: leanfe(..., backend='duckdb', con=duckdb.connect())\n"
+                "Users may want to set hard limits for max_threads and memory_limit in duckdb.con()"
+            )
         return leanfe_duckdb(
-            data=data,
-            y_col=y_col,
-            x_cols=x_cols,
-            fe_cols=fe_cols,
-            formula=formula,
-            weights=weights,
-            demean_tol=demean_tol,
-            max_iter=max_iter,
-            vcov=vcov,
-            cluster_cols=cluster_cols,
-            ssc=ssc,
-            sample_frac=sample_frac
+            data = data,
+            y_col = y_col,
+            x_cols = x_cols,
+            fe_cols = fe_cols,
+            formula = formula,
+            strategy = strategy,
+            weights = weights,
+            demean_tol = demean_tol,
+            max_iter = max_iter,
+            vcov = vcov,
+            cluster_cols = cluster_cols,
+            ssc = ssc,
+            sample_frac = sample_frac,
+            con = con
         )
     else:
         raise ValueError(f"backend must be 'polars' or 'duckdb', got '{backend}'")

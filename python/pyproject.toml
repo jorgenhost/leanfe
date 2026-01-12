@@ -7,7 +7,7 @@ name = "leanfe"
 version = "1.0.0"
 description = "Lean, fast fixed effects regression using Polars and DuckDB"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Diego Gentile Passaro", email = "diegogentilepassaro@gmail.com"}
@@ -27,10 +27,22 @@ classifiers = [
 ]
 dependencies = [
     "polars>=0.19.0",
-    "numpy>=1.20.0",
+    "numpy==2.2",
     "duckdb>=0.9.0",
     "scipy>=1.7.0",
     "pyarrow>=12.0.0",
+    "jupyter>=1.1.1",
+    "memory-profiler>=0.61.0",
+    "pyfixest>=0.40.0",
+    "numba>=0.63.1",
+    "pandas>=2.3.3",
+    "formulaic>=1.2.1",
+    "joblib>=1.5.3",
+    "tqdm>=4.67.1",
+    "matplotlib>=3.10.8",
+    "seaborn>=0.13.2",
+    "tabulate>=0.9.0",
+    "great-tables>=0.20.0",
 ]
 
 [project.optional-dependencies]

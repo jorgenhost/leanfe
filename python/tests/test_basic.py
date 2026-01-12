@@ -1,4 +1,4 @@
-"""Basic tests for fast-hdfe-reg package."""
+"""Basic tests for leanfe package."""
 
 import polars as pl
 import numpy as np
